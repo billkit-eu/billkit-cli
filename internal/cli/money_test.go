@@ -102,7 +102,7 @@ func TestRefundsCreateAlwaysSendsAnIdempotencyKey(t *testing.T) {
 
 	stderr, err := runCLI(t,
 		"refunds", "create", "--payment", "pay_123", "--amount", "500",
-		"--api-key", "sk_test_x", "--base-url", srv.URL)
+		"--api-key", "bk_test_x", "--base-url", srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestRefundsCreateKeepsAUserSuppliedKey(t *testing.T) {
 	if _, err := runCLI(t,
 		"refunds", "create", "--payment", "pay_123", "--amount", "500",
 		"--idempotency-key", "mine-42",
-		"--api-key", "sk_test_x", "--base-url", srv.URL); err != nil {
+		"--api-key", "bk_test_x", "--base-url", srv.URL); err != nil {
 		t.Fatal(err)
 	}
 	mutations := rec.mutations()
@@ -146,7 +146,7 @@ func TestCheckoutOneShotAlwaysSendsAnIdempotencyKey(t *testing.T) {
 	stderr, err := runCLI(t,
 		"checkout", "one-shot", "--customer", "cus_1", "--amount", "1999",
 		"--method", "ideal", "--success-url", "https://example.test/ok",
-		"--api-key", "sk_test_x", "--base-url", srv.URL)
+		"--api-key", "bk_test_x", "--base-url", srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +172,7 @@ func TestCheckoutOneShotKeepsAUserSuppliedKey(t *testing.T) {
 		"checkout", "one-shot", "--customer", "cus_1", "--amount", "1999",
 		"--method", "ideal", "--success-url", "https://example.test/ok",
 		"--idempotency-key", "mine-99",
-		"--api-key", "sk_test_x", "--base-url", srv.URL); err != nil {
+		"--api-key", "bk_test_x", "--base-url", srv.URL); err != nil {
 		t.Fatal(err)
 	}
 	mutations := rec.mutations()
@@ -189,11 +189,11 @@ func TestAPICommandKeysNonGETRequests(t *testing.T) {
 	defer srv.Close()
 
 	if _, err := runCLI(t, "api", "POST", "/v1/customers", "--data", "email=ada@example.test",
-		"--api-key", "sk_test_x", "--base-url", srv.URL); err != nil {
+		"--api-key", "bk_test_x", "--base-url", srv.URL); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := runCLI(t, "api", "GET", "/v1/customers",
-		"--api-key", "sk_test_x", "--base-url", srv.URL); err != nil {
+		"--api-key", "bk_test_x", "--base-url", srv.URL); err != nil {
 		t.Fatal(err)
 	}
 
@@ -217,10 +217,10 @@ func TestLoginMakesTheNewProfileDefault(t *testing.T) {
 	rec := &recorder{}
 	srv := tlsStub(t, rec.handler())
 
-	if _, err := runCLI(t, "login", "--api-key", "sk_live_AAAA1111", "--base-url", srv.URL); err != nil {
+	if _, err := runCLI(t, "login", "--api-key", "bk_live_AAAA1111", "--base-url", srv.URL); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runCLI(t, "login", "--api-key", "sk_test_BBBB2222", "--base-url", srv.URL); err != nil {
+	if _, err := runCLI(t, "login", "--api-key", "bk_test_BBBB2222", "--base-url", srv.URL); err != nil {
 		t.Fatal(err)
 	}
 
@@ -233,7 +233,7 @@ func TestLoginMakesTheNewProfileDefault(t *testing.T) {
 	if len(mutations) != 1 {
 		t.Fatalf("mutating requests = %d, want 1", len(mutations))
 	}
-	if got := mutations[0].auth; got != "Bearer sk_test_BBBB2222" {
+	if got := mutations[0].auth; got != "Bearer bk_test_BBBB2222" {
 		t.Fatalf("refund went out as %q, want the test key the CLI just said it logged into — "+
 			"that is real money spent moments after the CLI reported test mode", got)
 	}
@@ -246,10 +246,10 @@ func TestConfigUseSwitchesTheDefaultProfile(t *testing.T) {
 	rec := &recorder{}
 	srv := tlsStub(t, rec.handler())
 
-	if _, err := runCLI(t, "login", "--api-key", "sk_live_AAAA1111", "--base-url", srv.URL); err != nil {
+	if _, err := runCLI(t, "login", "--api-key", "bk_live_AAAA1111", "--base-url", srv.URL); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runCLI(t, "login", "--api-key", "sk_test_BBBB2222", "--base-url", srv.URL); err != nil {
+	if _, err := runCLI(t, "login", "--api-key", "bk_test_BBBB2222", "--base-url", srv.URL); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := runCLI(t, "config", "use", "live"); err != nil {
@@ -259,7 +259,7 @@ func TestConfigUseSwitchesTheDefaultProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	mutations := rec.mutations()
-	if len(mutations) != 1 || mutations[0].auth != "Bearer sk_live_AAAA1111" {
+	if len(mutations) != 1 || mutations[0].auth != "Bearer bk_live_AAAA1111" {
 		t.Fatalf("after `config use live` the refund went out as %+v", mutations)
 	}
 
@@ -277,7 +277,7 @@ func TestLiveMoneyCommandRefusesWithoutConfirmation(t *testing.T) {
 
 	stderr, err := runCLI(t,
 		"refunds", "create", "--payment", "pay_123", "--amount", "500",
-		"--api-key", "sk_live_AAAA1111", "--base-url", srv.URL)
+		"--api-key", "bk_live_AAAA1111", "--base-url", srv.URL)
 	if err == nil {
 		t.Fatal("a live refund ran with no confirmation and no --yes")
 	}
@@ -294,7 +294,7 @@ func TestLiveMoneyCommandRefusesWithoutConfirmation(t *testing.T) {
 	// With --yes the same command goes through.
 	if _, err := runCLI(t,
 		"refunds", "create", "--payment", "pay_123", "--amount", "500", "--yes",
-		"--api-key", "sk_live_AAAA1111", "--base-url", srv.URL); err != nil {
+		"--api-key", "bk_live_AAAA1111", "--base-url", srv.URL); err != nil {
 		t.Fatal(err)
 	}
 	if len(rec.mutations()) != 1 {
@@ -311,7 +311,7 @@ func TestTestModeMoneyCommandNeedsNoConfirmation(t *testing.T) {
 
 	stderr, err := runCLI(t,
 		"refunds", "create", "--payment", "pay_123", "--amount", "500",
-		"--api-key", "sk_test_x", "--base-url", srv.URL)
+		"--api-key", "bk_test_x", "--base-url", srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +333,7 @@ func TestLiveKeyOverPlainHTTPIsRefused(t *testing.T) {
 
 	_, err := runCLI(t,
 		"refunds", "create", "--payment", "pay_123", "--amount", "500", "--yes",
-		"--api-key", "sk_live_AAAA1111", "--base-url", srv.URL)
+		"--api-key", "bk_live_AAAA1111", "--base-url", srv.URL)
 	if err == nil {
 		t.Fatal("a live key was sent to a plain-HTTP host")
 	}
@@ -349,7 +349,7 @@ func TestLiveKeyOverPlainHTTPIsRefused(t *testing.T) {
 // cleartext case, so a test key aimed at a remote http host is refused too.
 func TestTestKeyOverPlainHTTPRemoteIsRefused(t *testing.T) {
 	_, err := runCLI(t, "refunds", "list",
-		"--api-key", "sk_test_x", "--base-url", "http://attacker.example")
+		"--api-key", "bk_test_x", "--base-url", "http://attacker.example")
 	if err == nil {
 		t.Fatal("expected a refusal for a remote plain-HTTP host")
 	}
@@ -374,7 +374,7 @@ func TestNonDefaultHostIsAnnounced(t *testing.T) {
 	srv := httptest.NewServer(rec.handler())
 	defer srv.Close()
 
-	if _, err := runCLI(t, "refunds", "list", "--api-key", "sk_test_x", "--base-url", srv.URL); err != nil {
+	if _, err := runCLI(t, "refunds", "list", "--api-key", "bk_test_x", "--base-url", srv.URL); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(notices.String(), srv.URL) {

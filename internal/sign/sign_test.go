@@ -10,7 +10,7 @@ import (
 )
 
 func TestHeaderMatchesBillKitScheme(t *testing.T) {
-	secret := "whsec_unit_test_secret"
+	secret := "bkwhsec_unit_test_secret"
 	body := []byte(`{"id":"evt_1","type":"customer.created"}`)
 	var ts int64 = 1_700_000_000
 
@@ -33,8 +33,8 @@ func TestNewWebhookSecretIsPrefixedAndUnique(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(a, "whsec_") {
-		t.Fatalf("missing whsec_ prefix: %q", a)
+	if !strings.HasPrefix(a, "bkwhsec_") {
+		t.Fatalf("missing bkwhsec_ prefix: %q", a)
 	}
 	b, _ := NewWebhookSecret()
 	if a == b {

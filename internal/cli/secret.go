@@ -22,7 +22,7 @@ var (
 // readSecretLine prompts on w and reads one line from r, without echoing it
 // back to the screen when r is a terminal.
 //
-// The reason is that the line is an sk_live_ key. Echoed, it lands in the
+// The reason is that the line is a bk_live_ key. Echoed, it lands in the
 // terminal's scrollback, in `script` and tmux logs, in a screen recording, and
 // in front of anyone watching the onboarding demo this command exists for.
 //

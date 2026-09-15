@@ -12,8 +12,8 @@ func TestLogoutDefaultProfile(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("BILLKIT_CONFIG_HOME", dir)
 	seedProfiles(t, map[string]config.Profile{
-		"test": {APIKey: "sk_test_x"},
-		"live": {APIKey: "sk_live_y"},
+		"test": {APIKey: "bk_test_x"},
+		"live": {APIKey: "bk_live_y"},
 	}, "test")
 
 	// No --profile, no --all → removes the default ("test").
@@ -40,9 +40,9 @@ func TestLogoutNeverPromotesLive(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("BILLKIT_CONFIG_HOME", dir)
 	seedProfiles(t, map[string]config.Profile{
-		"test":    {APIKey: "sk_test_x"},
-		"live":    {APIKey: "sk_live_y"},
-		"staging": {APIKey: "sk_test_z"},
+		"test":    {APIKey: "bk_test_x"},
+		"live":    {APIKey: "bk_live_y"},
+		"staging": {APIKey: "bk_test_z"},
 	}, "test")
 
 	flagProfile = ""
@@ -65,8 +65,8 @@ func TestLogoutAnnouncesASoleLiveSurvivor(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("BILLKIT_CONFIG_HOME", dir)
 	seedProfiles(t, map[string]config.Profile{
-		"test": {APIKey: "sk_test_x"},
-		"live": {APIKey: "sk_live_y"},
+		"test": {APIKey: "bk_test_x"},
+		"live": {APIKey: "bk_live_y"},
 	}, "test")
 
 	var errBuf bytes.Buffer
@@ -88,8 +88,8 @@ func TestLogoutAll(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("BILLKIT_CONFIG_HOME", dir)
 	seedProfiles(t, map[string]config.Profile{
-		"test": {APIKey: "sk_test_x"},
-		"live": {APIKey: "sk_live_y"},
+		"test": {APIKey: "bk_test_x"},
+		"live": {APIKey: "bk_live_y"},
 	}, "test")
 
 	flagProfile = ""
@@ -106,8 +106,8 @@ func TestLogoutNamedProfile(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("BILLKIT_CONFIG_HOME", dir)
 	seedProfiles(t, map[string]config.Profile{
-		"test": {APIKey: "sk_test_x"},
-		"live": {APIKey: "sk_live_y"},
+		"test": {APIKey: "bk_test_x"},
+		"live": {APIKey: "bk_live_y"},
 	}, "test")
 
 	flagProfile = "live"
@@ -127,7 +127,7 @@ func TestLogoutNamedProfile(t *testing.T) {
 func TestLogoutUnknownProfile(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("BILLKIT_CONFIG_HOME", dir)
-	seedProfiles(t, map[string]config.Profile{"test": {APIKey: "sk_test_x"}}, "test")
+	seedProfiles(t, map[string]config.Profile{"test": {APIKey: "bk_test_x"}}, "test")
 
 	flagProfile = "nope"
 	defer func() { flagProfile = "" }()

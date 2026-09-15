@@ -46,7 +46,7 @@ func writeProfile(t *testing.T, apiKey, baseURL string) string {
 // configured".
 func TestBillkitAPIKeyEnvIsHonoured(t *testing.T) {
 	t.Setenv("BILLKIT_CONFIG_HOME", t.TempDir())
-	t.Setenv(envAPIKey, "sk_test_FROMENV")
+	t.Setenv(envAPIKey, "bk_test_FROMENV")
 	rec := &recorder{}
 	srv := httptest.NewServer(rec.handler())
 	defer srv.Close()
@@ -58,7 +58,7 @@ func TestBillkitAPIKeyEnvIsHonoured(t *testing.T) {
 	if len(all) != 1 {
 		t.Fatalf("requests = %d, want 1", len(all))
 	}
-	if all[0].auth != "Bearer sk_test_FROMENV" {
+	if all[0].auth != "Bearer bk_test_FROMENV" {
 		t.Fatalf("Authorization = %q, want the key from $%s", all[0].auth, envAPIKey)
 	}
 }
@@ -73,14 +73,14 @@ func TestEnvCredentialsAreTrimmed(t *testing.T) {
 	srv := httptest.NewServer(rec.handler())
 	defer srv.Close()
 
-	t.Setenv(envAPIKey, "  sk_test_PADDED\n")
+	t.Setenv(envAPIKey, "  bk_test_PADDED\n")
 	t.Setenv(envBaseURL, srv.URL+"\n")
 
 	if _, err := runCLI(t, "api", "GET", "/v1/customers"); err != nil {
 		t.Fatal(err)
 	}
 	all := rec.all()
-	if len(all) != 1 || all[0].auth != "Bearer sk_test_PADDED" {
+	if len(all) != 1 || all[0].auth != "Bearer bk_test_PADDED" {
 		t.Fatalf("Authorization = %+v, want the trimmed key", all)
 	}
 }
@@ -91,17 +91,17 @@ func TestEnvCredentialsAreTrimmed(t *testing.T) {
 // override.
 func TestAPIKeyFlagBeatsTheEnvironment(t *testing.T) {
 	t.Setenv("BILLKIT_CONFIG_HOME", t.TempDir())
-	t.Setenv(envAPIKey, "sk_test_FROMENV")
+	t.Setenv(envAPIKey, "bk_test_FROMENV")
 	rec := &recorder{}
 	srv := httptest.NewServer(rec.handler())
 	defer srv.Close()
 
 	if _, err := runCLI(t, "api", "GET", "/v1/customers",
-		"--api-key", "sk_test_FROMFLAG", "--base-url", srv.URL); err != nil {
+		"--api-key", "bk_test_FROMFLAG", "--base-url", srv.URL); err != nil {
 		t.Fatal(err)
 	}
 	all := rec.all()
-	if len(all) != 1 || all[0].auth != "Bearer sk_test_FROMFLAG" {
+	if len(all) != 1 || all[0].auth != "Bearer bk_test_FROMFLAG" {
 		t.Fatalf("Authorization = %+v, want the flag's key", all)
 	}
 }
@@ -115,14 +115,14 @@ func TestEnvKeyBeatsTheStoredProfile(t *testing.T) {
 	srv := httptest.NewServer(rec.handler())
 	defer srv.Close()
 
-	writeProfile(t, "sk_test_STORED", srv.URL)
-	t.Setenv(envAPIKey, "sk_test_FROMENV")
+	writeProfile(t, "bk_test_STORED", srv.URL)
+	t.Setenv(envAPIKey, "bk_test_FROMENV")
 
 	if _, err := runCLI(t, "api", "GET", "/v1/customers", "--base-url", srv.URL); err != nil {
 		t.Fatal(err)
 	}
 	all := rec.all()
-	if len(all) != 1 || all[0].auth != "Bearer sk_test_FROMENV" {
+	if len(all) != 1 || all[0].auth != "Bearer bk_test_FROMENV" {
 		t.Fatalf("Authorization = %+v, want the environment's key", all)
 	}
 }
@@ -140,7 +140,7 @@ func TestBaseURLFlagBeatsEnvBeatsProfile(t *testing.T) {
 	flagSrv := httptest.NewServer(fromFlag.handler())
 	defer flagSrv.Close()
 
-	writeProfile(t, "sk_test_STORED", storedSrv.URL)
+	writeProfile(t, "bk_test_STORED", storedSrv.URL)
 
 	// Profile only.
 	if _, err := runCLI(t, "api", "GET", "/v1/customers"); err != nil {
@@ -177,8 +177,8 @@ func TestBillkitProfileEnvSelectsTheProfile(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("BILLKIT_CONFIG_HOME", dir)
 	body := `{"default_profile":"test","profiles":{` +
-		`"test":{"api_key":"sk_test_DEFAULT","base_url":"` + srv.URL + `"},` +
-		`"other":{"api_key":"sk_test_OTHER","base_url":"` + srv.URL + `"}}}`
+		`"test":{"api_key":"bk_test_DEFAULT","base_url":"` + srv.URL + `"},` +
+		`"other":{"api_key":"bk_test_OTHER","base_url":"` + srv.URL + `"}}}`
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -196,10 +196,10 @@ func TestBillkitProfileEnvSelectsTheProfile(t *testing.T) {
 	if len(all) != 2 {
 		t.Fatalf("requests = %d, want 2", len(all))
 	}
-	if all[0].auth != "Bearer sk_test_OTHER" {
+	if all[0].auth != "Bearer bk_test_OTHER" {
 		t.Errorf("$%s was ignored: Authorization = %q", envProfile, all[0].auth)
 	}
-	if all[1].auth != "Bearer sk_test_DEFAULT" {
+	if all[1].auth != "Bearer bk_test_DEFAULT" {
 		t.Errorf("--profile must beat $%s: Authorization = %q", envProfile, all[1].auth)
 	}
 }
@@ -215,7 +215,7 @@ func TestEnvLiveKeyOverPlainHTTPIsRefused(t *testing.T) {
 	srv := httptest.NewServer(rec.handler())
 	defer srv.Close()
 
-	const liveKey = "sk_live_ENVSECRET"
+	const liveKey = "bk_live_ENVSECRET"
 	t.Setenv(envAPIKey, liveKey)
 
 	for _, target := range []string{srv.URL, "http://billkit.internal:8000"} {
@@ -262,9 +262,9 @@ func TestLoginReadsAPipedKey(t *testing.T) {
 	srv := tlsStub(t, rec.handler())
 
 	for name, piped := range map[string]string{
-		"with a trailing newline":    "sk_test_PIPED\n",
-		"without a trailing newline": "sk_test_PIPED",
-		"with surrounding blanks":    "  sk_test_PIPED  \n",
+		"with a trailing newline":    "bk_test_PIPED\n",
+		"without a trailing newline": "bk_test_PIPED",
+		"with surrounding blanks":    "  bk_test_PIPED  \n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			rec.reset()
@@ -272,7 +272,7 @@ func TestLoginReadsAPipedKey(t *testing.T) {
 				t.Fatal(err)
 			}
 			all := rec.all()
-			if len(all) != 1 || all[0].auth != "Bearer sk_test_PIPED" {
+			if len(all) != 1 || all[0].auth != "Bearer bk_test_PIPED" {
 				t.Fatalf("login validated %+v, want the piped key", all)
 			}
 		})
@@ -284,7 +284,7 @@ func TestLoginReadsAPipedKey(t *testing.T) {
 // stdin here would fail the read, which is the point -- it must not be read.
 func TestLoginUsesTheEnvironmentKeyWithoutPrompting(t *testing.T) {
 	t.Setenv("BILLKIT_CONFIG_HOME", t.TempDir())
-	t.Setenv(envAPIKey, "sk_test_FROMENV")
+	t.Setenv(envAPIKey, "bk_test_FROMENV")
 	rec := &recorder{}
 	srv := tlsStub(t, rec.handler())
 
@@ -293,20 +293,20 @@ func TestLoginUsesTheEnvironmentKeyWithoutPrompting(t *testing.T) {
 		t.Fatal(err)
 	}
 	all := rec.all()
-	if len(all) != 1 || all[0].auth != "Bearer sk_test_FROMENV" {
+	if len(all) != 1 || all[0].auth != "Bearer bk_test_FROMENV" {
 		t.Fatalf("login validated %+v, want the key from $%s", all, envAPIKey)
 	}
 	if !strings.Contains(stderr, envAPIKey) {
 		t.Errorf("login should say which source it used, stderr = %q", stderr)
 	}
-	if strings.Contains(stderr, "sk_test_FROMENV") {
+	if strings.Contains(stderr, "bk_test_FROMENV") {
 		t.Error("login echoed the key it was given")
 	}
 }
 
 // TestLoginPromptDoesNotEchoOnATerminal is the P1-10 regression. The prompt
 // used to read the key with bufio.NewReader(os.Stdin).ReadString('\n') and
-// never touched the terminal's echo flag, so a pasted sk_live_ key was printed
+// never touched the terminal's echo flag, so a pasted bk_live_ key was printed
 // straight back onto the screen and into the scrollback, into tmux and
 // `script` logs, and into any recorded demo -- which is exactly the setting a
 // getting-started CLI is used in.
@@ -321,7 +321,7 @@ func TestLoginPromptDoesNotEchoOnATerminal(t *testing.T) {
 	}
 	defer func() { _ = r.Close() }()
 
-	const typed = "sk_live_TYPEDATTHEPROMPT\n"
+	const typed = "bk_live_TYPEDATTHEPROMPT\n"
 	if _, err := w.WriteString(typed); err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +333,7 @@ func TestLoginPromptDoesNotEchoOnATerminal(t *testing.T) {
 	// echo-suppressed read the way a real one would.
 	called := 0
 	restore := stubTerminal(t, func(fd uintptr) bool { return fd == r.Fd() },
-		func(uintptr) ([]byte, error) { called++; return []byte("sk_test_NOTECHOED"), nil })
+		func(uintptr) ([]byte, error) { called++; return []byte("bk_test_NOTECHOED"), nil })
 	defer restore()
 
 	var prompt bytes.Buffer
@@ -344,7 +344,7 @@ func TestLoginPromptDoesNotEchoOnATerminal(t *testing.T) {
 	if called != 1 {
 		t.Fatalf("the echo-suppressed read ran %d times, want 1; a terminal key is being echoed", called)
 	}
-	if got != "sk_test_NOTECHOED" {
+	if got != "bk_test_NOTECHOED" {
 		t.Fatalf("read %q, want the value from the echo-suppressed read", got)
 	}
 
@@ -362,7 +362,7 @@ func TestLoginPromptDoesNotEchoOnATerminal(t *testing.T) {
 	if !strings.HasSuffix(prompt.String(), "\n") {
 		t.Errorf("no newline printed after the hidden read: %q", prompt.String())
 	}
-	if strings.Contains(prompt.String(), "sk_") {
+	if strings.Contains(prompt.String(), "bk_") {
 		t.Errorf("the prompt writer saw a key: %q", prompt.String())
 	}
 }
@@ -377,7 +377,7 @@ func TestReadSecretLineUsesTheBufferedPathOffATerminal(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = r.Close() }()
-	if _, err := w.WriteString("sk_test_PIPED\n"); err != nil {
+	if _, err := w.WriteString("bk_test_PIPED\n"); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Close(); err != nil {
@@ -388,7 +388,7 @@ func TestReadSecretLineUsesTheBufferedPathOffATerminal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "sk_test_PIPED" {
+	if got != "bk_test_PIPED" {
 		t.Fatalf("read %q from a pipe, want the piped key", got)
 	}
 }

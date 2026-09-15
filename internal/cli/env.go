@@ -42,7 +42,7 @@ const (
 // An environment-supplied key is not trusted any further than a flag-supplied
 // one. Both land in resolve(), so both go through config.CheckTransport before
 // a byte reaches the wire: a live key from BILLKIT_API_KEY pointed at a plain
-// http host is refused exactly as `--api-key sk_live_… --base-url http://…`
+// http host is refused exactly as `--api-key bk_live_… --base-url http://…`
 // is.
 
 // envValue reads an environment variable and trims surrounding whitespace.

@@ -74,7 +74,7 @@ func (tg *target) got() []string {
 func (tg *target) forwarder() *forwarder {
 	return &forwarder{
 		url:    tg.URL,
-		secret: "whsec_unit_test",
+		secret: "bkwhsec_unit_test",
 		client: tg.Client(),
 		out:    io.Discard,
 		logOut: io.Discard,
@@ -130,7 +130,7 @@ func eventJSON(id, etype string, created int64) string {
 
 // testListener runs the real reconnect loop at test speed.
 func testListener(baseURL string, fwd *forwarder, errOut io.Writer) *listener {
-	l := newListener(baseURL, "sk_test_unit", "", fwd, errOut)
+	l := newListener(baseURL, "bk_test_unit", "", fwd, errOut)
 	l.stallTimeout = 150 * time.Millisecond
 	l.stallStep = 15 * time.Millisecond
 	l.settle = 0
@@ -179,7 +179,7 @@ func (f *fakeFill) eventsAfter(_ context.Context, _ string, _ int64) ([][]byte, 
 // --- SSE parsing + forwarding (pre-existing behaviour) ---------------------
 
 func TestConsumeSSEForwardsOnlyMessageFramesWithValidSignature(t *testing.T) {
-	const secret = "whsec_unit_test"
+	const secret = "bkwhsec_unit_test"
 
 	type captured struct{ body, sig, etype string }
 	var got []captured
@@ -790,7 +790,7 @@ func TestGapFillerWalksBackToTheLastSeenEvent(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	g := &apiGapFiller{client: api.New(srv.URL, "sk_test_unit", "dev", srv.Client())}
+	g := &apiGapFiller{client: api.New(srv.URL, "bk_test_unit", "dev", srv.Client())}
 
 	newestID, newestAt, err := g.newest(context.Background())
 	if err != nil {
@@ -834,7 +834,7 @@ func TestGapFillerStopsAtAnOlderEventWhenTheCursorIsGone(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	g := &apiGapFiller{client: api.New(srv.URL, "sk_test_unit", "dev", srv.Client())}
+	g := &apiGapFiller{client: api.New(srv.URL, "bk_test_unit", "dev", srv.Client())}
 	got, _, err := g.eventsAfter(context.Background(), "evt_2", 102)
 	if err != nil {
 		t.Fatal(err)
@@ -864,7 +864,7 @@ func TestGapFillerReportsATruncatedReplay(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	g := &apiGapFiller{client: api.New(srv.URL, "sk_test_unit", "dev", srv.Client())}
+	g := &apiGapFiller{client: api.New(srv.URL, "bk_test_unit", "dev", srv.Client())}
 	got, truncated, err := g.eventsAfter(context.Background(), "evt_missing", 1)
 	if err != nil {
 		t.Fatal(err)

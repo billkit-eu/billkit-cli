@@ -58,8 +58,8 @@ func captureWarnings(t *testing.T) *bytes.Buffer {
 
 func TestModeFromKeyPrefix(t *testing.T) {
 	cases := map[string]string{
-		"sk_test_abc": "test",
-		"sk_live_abc": "live",
+		"bk_test_abc": "test",
+		"bk_live_abc": "live",
 		"garbage":     "",
 		"":            "",
 	}
@@ -82,8 +82,8 @@ func TestSaveLoadResolveRoundtrip(t *testing.T) {
 		t.Fatalf("expected empty config, got %d profiles", len(cfg.Profiles))
 	}
 
-	cfg.Set("test", Profile{APIKey: "sk_test_x"})
-	cfg.Set("live", Profile{APIKey: "sk_live_y", BaseURL: "https://self.example"})
+	cfg.Set("test", Profile{APIKey: "bk_test_x"})
+	cfg.Set("live", Profile{APIKey: "bk_live_y", BaseURL: "https://self.example"})
 	if err := cfg.Save(); err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ func TestSaveLoadResolveRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if name != "test" || p.APIKey != "sk_test_x" {
+	if name != "test" || p.APIKey != "bk_test_x" {
 		t.Fatalf("resolve default = (%q, %q)", name, p.APIKey)
 	}
 	if p.BaseURL != DefaultBaseURL {
@@ -131,8 +131,8 @@ func TestResolveWithoutProfilesErrors(t *testing.T) {
 
 func TestDelete(t *testing.T) {
 	cfg := &Config{Profiles: map[string]Profile{}}
-	cfg.Set("test", Profile{APIKey: "sk_test_x"})
-	cfg.Set("live", Profile{APIKey: "sk_live_y"})
+	cfg.Set("test", Profile{APIKey: "bk_test_x"})
+	cfg.Set("live", Profile{APIKey: "bk_live_y"})
 	if cfg.DefaultProfile != "test" {
 		t.Fatalf("default = %q, want test (first Set)", cfg.DefaultProfile)
 	}
@@ -169,7 +169,7 @@ func TestDelete(t *testing.T) {
 // TestSaveTightensPreexistingFileAndDir is the P0-1 regression. os.WriteFile
 // and os.MkdirAll only apply their mode when they create something, so a
 // config.json that arrived from a dotfiles checkout, a CI cache, or a
-// container image at 0644 kept 0644 and quietly took delivery of an sk_live_
+// container image at 0644 kept 0644 and quietly took delivery of a bk_live_
 // key. The old Save() passes every other test in this file, because they all
 // start from an empty t.TempDir().
 func TestSaveTightensPreexistingFileAndDir(t *testing.T) {
@@ -197,7 +197,7 @@ func TestSaveTightensPreexistingFileAndDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg.Set("live", Profile{APIKey: "sk_live_SECRET"})
+	cfg.Set("live", Profile{APIKey: "bk_live_SECRET"})
 	if err := cfg.Save(); err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +251,7 @@ func TestSaveReplacesASymlinkRatherThanFollowingIt(t *testing.T) {
 	t.Setenv("BILLKIT_CONFIG_HOME", dir)
 	captureWarnings(t)
 
-	cfg := &Config{Profiles: map[string]Profile{"live": {APIKey: "sk_live_SECRET"}}, DefaultProfile: "live"}
+	cfg := &Config{Profiles: map[string]Profile{"live": {APIKey: "bk_live_SECRET"}}, DefaultProfile: "live"}
 	if err := cfg.Save(); err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +260,7 @@ func TestSaveReplacesASymlinkRatherThanFollowingIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(planted), "sk_live_SECRET") {
+	if strings.Contains(string(planted), "bk_live_SECRET") {
 		t.Error("the key was written through the planted symlink into a 0644 file")
 	}
 	info, err := os.Lstat(path)
@@ -278,7 +278,7 @@ func TestLoadWarnsWhenTheConfigIsWorldReadable(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("BILLKIT_CONFIG_HOME", dir)
 	path := filepath.Join(dir, "config.json")
-	if err := os.WriteFile(path, []byte(`{"default_profile":"live","profiles":{"live":{"api_key":"sk_live_x"}}}`), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(`{"default_profile":"live","profiles":{"live":{"api_key":"bk_live_x"}}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(path, 0o644); err != nil {
@@ -376,16 +376,16 @@ func TestCheckTransportRefusesLiveKeysOverCleartext(t *testing.T) {
 		apiKey  string
 		wantErr bool
 	}{
-		{"live over https", "https://api.billkit.eu", "sk_live_x", false},
-		{"live over http loopback", "http://127.0.0.1:8000", "sk_live_x", true},
-		{"live over http remote", "http://attacker.example", "sk_live_x", true},
-		{"test over http loopback", "http://127.0.0.1:8000", "sk_test_x", false},
-		{"test over http localhost", "http://localhost:8000", "sk_test_x", false},
-		{"test over http ipv6 loopback", "http://[::1]:8000", "sk_test_x", false},
-		{"test over http remote", "http://attacker.example", "sk_test_x", true},
-		{"test over https", "https://self.example", "sk_test_x", false},
+		{"live over https", "https://api.billkit.eu", "bk_live_x", false},
+		{"live over http loopback", "http://127.0.0.1:8000", "bk_live_x", true},
+		{"live over http remote", "http://attacker.example", "bk_live_x", true},
+		{"test over http loopback", "http://127.0.0.1:8000", "bk_test_x", false},
+		{"test over http localhost", "http://localhost:8000", "bk_test_x", false},
+		{"test over http ipv6 loopback", "http://[::1]:8000", "bk_test_x", false},
+		{"test over http remote", "http://attacker.example", "bk_test_x", true},
+		{"test over https", "https://self.example", "bk_test_x", false},
 		{"unknown key over http loopback", "http://127.0.0.1:8000", "opaque-token", true},
-		{"garbage host", "not-a-url", "sk_test_x", true},
+		{"garbage host", "not-a-url", "bk_test_x", true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -407,7 +407,7 @@ func TestResolveRejectsAMalformedStoredBaseURL(t *testing.T) {
 
 	cfg := &Config{
 		DefaultProfile: "live",
-		Profiles:       map[string]Profile{"live": {APIKey: "sk_live_x", BaseURL: "attacker.example"}},
+		Profiles:       map[string]Profile{"live": {APIKey: "bk_live_x", BaseURL: "attacker.example"}},
 	}
 	if err := cfg.Save(); err != nil {
 		t.Fatal(err)
@@ -427,8 +427,8 @@ func TestResolveRejectsAMalformedStoredBaseURL(t *testing.T) {
 
 func TestSetDefault(t *testing.T) {
 	cfg := &Config{Profiles: map[string]Profile{}}
-	cfg.Set("live", Profile{APIKey: "sk_live_y"})
-	cfg.Set("test", Profile{APIKey: "sk_test_x"})
+	cfg.Set("live", Profile{APIKey: "bk_live_y"})
+	cfg.Set("test", Profile{APIKey: "bk_test_x"})
 	if cfg.DefaultProfile != "live" {
 		t.Fatalf("default = %q, want live (first Set)", cfg.DefaultProfile)
 	}

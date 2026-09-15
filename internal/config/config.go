@@ -60,12 +60,12 @@ type Config struct {
 	Profiles       map[string]Profile `json:"profiles"`
 }
 
-// Mode returns "test" or "live" inferred from an sk_test_/sk_live_ key prefix.
+// Mode returns "test" or "live" inferred from a bk_test_/bk_live_ key prefix.
 func Mode(apiKey string) string {
 	switch {
-	case strings.HasPrefix(apiKey, "sk_live_"):
+	case strings.HasPrefix(apiKey, "bk_live_"):
 		return "live"
-	case strings.HasPrefix(apiKey, "sk_test_"):
+	case strings.HasPrefix(apiKey, "bk_test_"):
 		return "test"
 	default:
 		return ""
@@ -255,7 +255,7 @@ func pathUnder(dir, path string, fold bool) bool {
 }
 
 // ValidateBaseURL rejects an API host that is not a plain http(s) URL. The
-// stored base_url is followed with an `Authorization: Bearer sk_live_…`
+// stored base_url is followed with an `Authorization: Bearer bk_live_…`
 // header attached, so anything that is not an ordinary origin (a file://
 // path, a URL carrying embedded credentials, a bare hostname with no scheme)
 // is refused rather than dialled.
@@ -299,7 +299,7 @@ func CheckTransport(baseURL, apiKey string) error {
 		return fmt.Errorf("refusing to send an API key to %s over plain HTTP: use https://, or http:// only for a loopback host", baseURL)
 	}
 	if Mode(apiKey) != "test" {
-		return fmt.Errorf("refusing to send this API key to %s over plain HTTP: http:// is only accepted for a loopback host with an sk_test_ key", baseURL)
+		return fmt.Errorf("refusing to send this API key to %s over plain HTTP: http:// is only accepted for a loopback host with a bk_test_ key", baseURL)
 	}
 	return nil
 }

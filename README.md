@@ -49,7 +49,7 @@ That lands as `billkit`, the same name the other two routes install.
 ## Log in
 
 ```bash
-billkit login            # prompts for an sk_test_… / sk_live_… key
+billkit login            # prompts for a bk_test_… / bk_live_… key
 # stored in ~/.billkit/config.json, profile chosen by key prefix
 billkit config list      # see the profiles; * marks the default
 billkit config use test  # switch the default without deleting credentials
@@ -77,7 +77,7 @@ everywhere else.
 Put the key in the environment, not in a flag:
 
 ```bash
-export BILLKIT_API_KEY=sk_test_…
+export BILLKIT_API_KEY=bk_test_…
 billkit api GET /v1/customers
 ```
 
@@ -105,7 +105,7 @@ billkit listen --forward-to http://localhost:3000/billkit/webhook
 signed with a freshly-generated secret it prints on start:
 
 ```
-> Your webhook signing secret is whsec_…
+> Your webhook signing secret is bkwhsec_…
 ```
 
 Set that as your app's webhook secret and verify with any BillKit SDK — no ngrok

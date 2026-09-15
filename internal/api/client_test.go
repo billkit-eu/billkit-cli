@@ -15,7 +15,7 @@ import (
 
 func TestDoSetsHeadersAndDecodesBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Authorization"); got != "Bearer sk_test_x" {
+		if got := r.Header.Get("Authorization"); got != "Bearer bk_test_x" {
 			t.Errorf("Authorization = %q", got)
 		}
 		if got := r.Header.Get("User-Agent"); got != "billkit-cli/1.2.3" {
@@ -37,7 +37,7 @@ func TestDoSetsHeadersAndDecodesBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "sk_test_x", "1.2.3", srv.Client())
+	c := New(srv.URL, "bk_test_x", "1.2.3", srv.Client())
 	out, err := c.Do(context.Background(), http.MethodPost, "/v1/customers", map[string]any{"email": "a@b.co"})
 	if err != nil {
 		t.Fatal(err)
@@ -54,7 +54,7 @@ func TestDoMapsNonSuccessToAPIError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "sk_test_x", "1.0", srv.Client())
+	c := New(srv.URL, "bk_test_x", "1.0", srv.Client())
 	_, err := c.Do(context.Background(), http.MethodGet, "/v1/customers/x", nil)
 	if err == nil {
 		t.Fatal("expected an error")
@@ -79,7 +79,7 @@ func TestDoParsesErrorEnvelopeFields(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "sk_test_x", "1.0", srv.Client())
+	c := New(srv.URL, "bk_test_x", "1.0", srv.Client())
 	_, err := c.Do(context.Background(), http.MethodPost, "/v1/refunds", map[string]any{})
 	apiErr, ok := err.(*APIError)
 	if !ok {
@@ -122,7 +122,7 @@ func TestWithIdempotencyKeySetsHeader(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "sk_test_x", "1.0", srv.Client())
+	c := New(srv.URL, "bk_test_x", "1.0", srv.Client())
 	if _, err := c.Do(context.Background(), http.MethodPost, "/v1/refunds", map[string]any{"payment_id": "pay_1"}, WithIdempotencyKey("idem-123")); err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +162,7 @@ func TestRetryReusesTheSameIdempotencyKey(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "sk_test_x", "1.0", srv.Client())
+	c := New(srv.URL, "bk_test_x", "1.0", srv.Client())
 	out, err := c.Do(context.Background(), http.MethodPost, "/v1/refunds", map[string]any{"payment_id": "pay_1"})
 	if err != nil {
 		t.Fatal(err)
@@ -192,7 +192,7 @@ func TestRetryStopsAfterTwoExtraAttempts(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "sk_test_x", "1.0", srv.Client())
+	c := New(srv.URL, "bk_test_x", "1.0", srv.Client())
 	if _, err := c.Do(context.Background(), http.MethodPost, "/v1/refunds", map[string]any{}); err == nil {
 		t.Fatal("expected the 502 to surface after the retries were exhausted")
 	}
@@ -210,7 +210,7 @@ func TestNoRetryOnClientError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "sk_test_x", "1.0", srv.Client())
+	c := New(srv.URL, "bk_test_x", "1.0", srv.Client())
 	if _, err := c.Do(context.Background(), http.MethodPost, "/v1/refunds", map[string]any{}); err == nil {
 		t.Fatal("expected an error")
 	}
@@ -231,7 +231,7 @@ func TestRetryHonoursRetryAfterOn429(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "sk_test_x", "1.0", srv.Client())
+	c := New(srv.URL, "bk_test_x", "1.0", srv.Client())
 	start := time.Now()
 	if _, err := c.Do(context.Background(), http.MethodGet, "/v1/refunds", nil); err != nil {
 		t.Fatal(err)

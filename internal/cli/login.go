@@ -14,7 +14,7 @@ func loginCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "login",
 		Short: "Store an API key for a profile",
-		Long: "Store a BillKit API key (sk_test_… / sk_live_…) in ~/.billkit/config.json.\n" +
+		Long: "Store a BillKit API key (bk_test_… / bk_live_…) in ~/.billkit/config.json.\n" +
 			"The key's prefix selects the profile (test/live) and the key is validated\n" +
 			"against the API before being saved.\n\n" +
 			"The prompt does not echo what you type. To skip it non-interactively,\n" +
@@ -27,7 +27,7 @@ func loginCmd() *cobra.Command {
 			case key == "":
 				var err error
 				key, err = readSecretLine(cmd.InOrStdin(), cmd.ErrOrStderr(),
-					"Enter your BillKit API key (sk_test_… / sk_live_…): ")
+					"Enter your BillKit API key (bk_test_… / bk_live_…): ")
 				if err != nil {
 					return err
 				}
@@ -39,7 +39,7 @@ func loginCmd() *cobra.Command {
 			}
 			mode := config.Mode(key)
 			if mode == "" {
-				return fmt.Errorf("that doesn't look like a BillKit key (expected sk_test_… or sk_live_…)")
+				return fmt.Errorf("that doesn't look like a BillKit key (expected bk_test_… or bk_live_…)")
 			}
 
 			baseURL := baseURLOverride()

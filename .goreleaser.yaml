@@ -42,7 +42,7 @@ builds:
 
 # Developer ID signing + Apple notarization for the two darwin binaries.
 #
-# Why this exists: the CLI holds `sk_live_` keys on customers' laptops. An
+# Why this exists: the CLI holds `bk_live_` keys on customers' laptops. An
 # unsigned binary makes macOS tell the user the developer cannot be verified and
 # invites them to click past a security warning, which is the last habit this
 # tool should be teaching. Signing plus notarization fixes every download path

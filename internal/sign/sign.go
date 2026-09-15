@@ -23,11 +23,11 @@ func Header(secret string, timestamp int64, body []byte) string {
 	return "t=" + strconv.FormatInt(timestamp, 10) + ",v1=" + hex.EncodeToString(mac.Sum(nil))
 }
 
-// NewWebhookSecret mints an ephemeral whsec_… secret for a listen session.
+// NewWebhookSecret mints an ephemeral bkwhsec_… secret for a listen session.
 func NewWebhookSecret() (string, error) {
 	buf := make([]byte, 24)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}
-	return "whsec_" + base64.RawURLEncoding.EncodeToString(buf), nil
+	return "bkwhsec_" + base64.RawURLEncoding.EncodeToString(buf), nil
 }
