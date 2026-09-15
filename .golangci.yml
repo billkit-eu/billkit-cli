@@ -1,0 +1,18 @@
+version: "2"
+
+# Default linters (errcheck, govet, ineffassign, staticcheck, unused) plus a
+# couple of high-signal extras.
+linters:
+  enable:
+    - misspell
+    - unconvert
+  settings:
+    errcheck:
+      # Terminal output writes to os.Stdout/Stderr can only fail on a broken
+      # pipe, which a CLI can't act on — checking every print is noise, not
+      # safety. (Close() and hasher writes are handled explicitly at the call
+      # site.)
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln

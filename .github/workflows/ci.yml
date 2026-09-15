@@ -1,0 +1,44 @@
+name: CI
+
+# Unit tests only, and the same gates the monorepo runs on every push to cli/.
+# They run here too because this is the repository a contributor reads, the
+# repository the module proxy serves, and the repository a release is cut from:
+# a green tick has to mean something on its own.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Go ${{ matrix.go }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The CLI ships for all three, writes files with an eye on their
+        # permission models, and reads terminals, so all three get tested.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: ['1.26']
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Format check
+        if: runner.os == 'Linux'
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+      - name: Lint
+        if: runner.os == 'Linux'
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Build
+        run: go build ./...

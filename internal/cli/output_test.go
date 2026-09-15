@@ -1,0 +1,128 @@
+package cli
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
+
+// colorizeJSON must always emit valid JSON, including for edge-case inputs
+// (control chars, empty containers, top-level scalars, floats/negatives).
+func TestColorizeJSONAlwaysValid(t *testing.T) {
+	cases := []string{
+		`{}`,
+		`[]`,
+		`42`,
+		`-3.14e10`,
+		`null`,
+		`"top-level"`,
+		`{"tab":"a\tb\nc"}`,
+		// Control chars (NUL, DEL) arrive as \u escapes and are decoded to
+		// real runes by json.Decoder — the case the strconv.Quote bug broke.
+		"{\"ctrl\":\"a\\u0000b\\u007fc\"}",
+		`{"unicode":"héllo 🎉","html":"<a>&</a>"}`,
+		`{"nested":{"a":[1,2,{"b":null}],"c":{}},"n":-9007199254740991}`,
+		`[{"id":"re_1","amount_cents":500,"livemode":false}]`,
+	}
+	for _, in := range cases {
+		var sb strings.Builder
+		if err := colorizeJSON(&sb, []byte(in), false); err != nil {
+			t.Fatalf("colorizeJSON(%s) error: %v", in, err)
+		}
+		got := sb.String()
+		if !json.Valid([]byte(got)) {
+			t.Fatalf("colorizeJSON(%s) produced invalid JSON:\n%s", in, got)
+		}
+		var b any
+		if err := json.Unmarshal([]byte(got), &b); err != nil {
+			t.Fatalf("re-parse of colorized %s failed: %v", in, err)
+		}
+	}
+}
+
+func TestColorizeJSONPreservesKeyOrderPlain(t *testing.T) {
+	// Object key order must survive (a map round-trip would scramble it).
+	raw := []byte(`{"id":"re_1","amount_cents":500,"livemode":false,"reason":null,"nested":{"b":1,"a":2},"list":[1,"two",true]}`)
+	var sb strings.Builder
+	if err := colorizeJSON(&sb, raw, false); err != nil {
+		t.Fatal(err)
+	}
+	got := sb.String()
+
+	if strings.Contains(got, "\x1b[") {
+		t.Fatalf("unexpected ANSI in plain output:\n%s", got)
+	}
+	order := []string{`"id"`, `"amount_cents"`, `"livemode"`, `"reason"`, `"nested"`, `"list"`}
+	last := -1
+	for _, k := range order {
+		i := strings.Index(got, k)
+		if i < 0 {
+			t.Fatalf("missing key %s in:\n%s", k, got)
+		}
+		if i < last {
+			t.Fatalf("key %s out of order in:\n%s", k, got)
+		}
+		last = i
+	}
+	for _, want := range []string{`"re_1"`, "500", "false", "null", "[", "]", "{", "}"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in:\n%s", want, got)
+		}
+	}
+	if !strings.Contains(got, "\n  ") {
+		t.Fatalf("expected 2-space indentation in:\n%s", got)
+	}
+}
+
+func TestColorizeJSONColorWraps(t *testing.T) {
+	raw := []byte(`{"k":"v"}`)
+	var sb strings.Builder
+	if err := colorizeJSON(&sb, raw, true); err != nil {
+		t.Fatal(err)
+	}
+	got := sb.String()
+	if !strings.Contains(got, ansiKey) || !strings.Contains(got, ansiStr) {
+		t.Fatalf("expected key/string colour codes in:\n%q", got)
+	}
+	if !strings.Contains(got, ansiReset) {
+		t.Fatalf("expected reset code in:\n%q", got)
+	}
+}
+
+func TestColorEnabledRespectsNever(t *testing.T) {
+	prev := flagColor
+	defer func() { flagColor = prev }()
+	flagColor = "never"
+	if colorEnabled(&strings.Builder{}) {
+		t.Fatal("never should disable color")
+	}
+	flagColor = "always"
+	if !colorEnabled(&strings.Builder{}) {
+		t.Fatal("always should enable color")
+	}
+}
+
+func TestColorEnabledAutoOffForNonTerminal(t *testing.T) {
+	prev := flagColor
+	defer func() { flagColor = prev }()
+	flagColor = "auto"
+	if colorEnabled(&strings.Builder{}) {
+		t.Fatal("auto should disable color for a non-terminal writer")
+	}
+}
+
+func TestParseMetadata(t *testing.T) {
+	m, err := parseMetadata([]string{"order=42", "tier=gold"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m["order"] != "42" || m["tier"] != "gold" {
+		t.Fatalf("metadata = %v", m)
+	}
+	if _, err := parseMetadata([]string{"bad"}); err == nil {
+		t.Fatal("expected error for malformed pair")
+	}
+	if m, _ := parseMetadata(nil); m != nil {
+		t.Fatal("empty input should yield nil map")
+	}
+}

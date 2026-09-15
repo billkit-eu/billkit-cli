@@ -1,0 +1,166 @@
+# GoReleaser config for the billkit CLI.
+#
+# This does NOT run here. Development lives in the billstack monorepo, but the
+# release runs in the public mirror `billkit-eu/billkit-cli`, because that is
+# where the tag, the module path and the downloadable release all live. The
+# mirror's own `.github/workflows/publish.yml` (installed by the split, from
+# sdk/scripts/split-templates/cli/) is what invokes this file on a `v*` tag.
+#
+# NOTE: not yet exercised by a real release. Before the first tag, validate with
+# `goreleaser check` and a `goreleaser release --snapshot --clean`.
+#
+# The macOS signing and notarization credentials are documented on the
+# `notarize:` block below, and mirrored in cli/README.md under "Signing and
+# notarization". Nothing secret lives in this file; it reads five environment
+# variables and skips itself when they are absent.
+version: 2
+
+project_name: billkit
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: billkit
+    # The main package lives at cmd/billkit so that `go install` names the
+    # binary `billkit` too. `binary:` below only ever renamed the GoReleaser
+    # artifact, which left the from-source install path with a different name.
+    main: ./cmd/billkit
+    binary: billkit
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X github.com/billkit-eu/billkit-cli/internal/cli.Version={{ .Version }}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+# Developer ID signing + Apple notarization for the two darwin binaries.
+#
+# Why this exists: the CLI holds `sk_live_` keys on customers' laptops. An
+# unsigned binary makes macOS tell the user the developer cannot be verified and
+# invites them to click past a security warning, which is the last habit this
+# tool should be teaching. Signing plus notarization fixes every download path
+# at once: Homebrew, `install.sh`, and a browser download of the `.tar.gz`.
+#
+# Mechanism: GoReleaser's cross-platform `notarize.macos`, which embeds
+# anchore/quill. It is chosen over the `notarize.macos_native` block because
+# native is GoReleaser Pro only AND needs codesign/xcrun, i.e. a macOS runner;
+# the quill path runs on the `ubuntu-latest` runner publish.yml already uses.
+# It signs Mach-O binaries directly, which is exactly what we ship: bare
+# executables in a tar.gz, no .app bundle, no .dmg, no .pkg.
+#
+# Nothing is stapled, and nothing can be. Apple: "Although tickets are created
+# for standalone binaries, it's not currently possible to staple tickets to
+# them." `stapler` handles .app, .dmg and flat .pkg only. So Gatekeeper looks the
+# ticket up with Apple on first run instead of reading it off disk, which costs a
+# network round trip on exactly one path: a quarantined first run. `install.sh`
+# is unaffected either way, because curl sets no quarantine attribute and tar
+# does not propagate one. See sdk/RELEASING.md for the full breakdown.
+#
+# Credentials (all five, or none):
+#   MACOS_SIGN_P12           base64 of the Developer ID Application .p12
+#   MACOS_SIGN_PASSWORD      the password that .p12 was exported with
+#   MACOS_NOTARY_ISSUER_ID   App Store Connect API issuer UUID
+#   MACOS_NOTARY_KEY_ID      App Store Connect API key ID
+#   MACOS_NOTARY_KEY         base64 of the App Store Connect .p8 private key
+#
+# Degrading gracefully is deliberate, and it is the same bargain the Homebrew
+# cask makes below: a laptop snapshot, a fork, or a CI run without the secrets
+# still produces working archives instead of failing after the build. `index
+# .Env "..."` and not `.Env.MACOS_SIGN_P12`, because the dotted form is a hard
+# error when the name is absent from the environment entirely ("map has no entry
+# for key"), and absent is the normal state on a laptop.
+#
+# The gate requires all five rather than any one of them, on purpose. A partial
+# set would otherwise sign without notarizing, and a signed-but-unnotarized
+# binary still trips Gatekeeper, so it would look fixed and not be. All or
+# nothing keeps the two possible outcomes honest.
+notarize:
+  macos:
+    - ids:
+        - billkit
+      enabled: >-
+        {{ if and (index .Env "MACOS_SIGN_P12")
+                  (index .Env "MACOS_SIGN_PASSWORD")
+                  (index .Env "MACOS_NOTARY_ISSUER_ID")
+                  (index .Env "MACOS_NOTARY_KEY_ID")
+                  (index .Env "MACOS_NOTARY_KEY") }}true{{ else }}false{{ end }}
+      sign:
+        certificate: '{{ index .Env "MACOS_SIGN_P12" }}'
+        password: '{{ index .Env "MACOS_SIGN_PASSWORD" }}'
+      notarize:
+        issuer_id: '{{ index .Env "MACOS_NOTARY_ISSUER_ID" }}'
+        key_id: '{{ index .Env "MACOS_NOTARY_KEY_ID" }}'
+        key: '{{ index .Env "MACOS_NOTARY_KEY" }}'
+        # Wait, because the alternative is publishing a release whose binaries
+        # Apple has not accepted yet. Two darwin binaries means two submissions,
+        # so publish.yml passes `--timeout 60m` to keep GoReleaser's own 30m
+        # default from cutting the second one short.
+        wait: true
+        timeout: 20m
+
+archives:
+  - id: billkit
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+# A cask rather than a formula. Homebrew asks that pre-built binaries ship as
+# casks, and GoReleaser has deprecated `brews` accordingly: with `brews` here,
+# `goreleaser check` exits non-zero on the deprecation alone, which is a poor
+# thing to have to ignore before every release.
+#
+# The cost is that casks are macOS-only, so `brew install` is a macOS path now.
+# Linux keeps `install.sh` and the release archives, which is what the docs say.
+homebrew_casks:
+  - name: billkit
+    binaries:
+      - billkit
+    # The cask push is conditional on the token, deliberately. It happens *after*
+    # the GitHub release has been created and uploaded, so a push that cannot
+    # authenticate fails the job over a release that actually shipped, and the
+    # failure reads as though the release failed. So the step is skipped unless
+    # `HOMEBREW_TAP_TOKEN` is set, and publish.yml prints a notice when it is not.
+    #
+    # `index .Env "..."` rather than `.Env.HOMEBREW_TAP_TOKEN`, because the dotted
+    # form is a hard error when the name is absent from the environment entirely
+    # ("map has no entry for key"), and absent is the normal state on a laptop.
+    # `index` returns an empty string instead, which is the condition we want to
+    # test. Verified both ways with `goreleaser release --snapshot`.
+    skip_upload: '{{ if index .Env "HOMEBREW_TAP_TOKEN" }}false{{ else }}true{{ end }}'
+    repository:
+      owner: billkit-eu
+      name: homebrew-tap
+      token: '{{ index .Env "HOMEBREW_TAP_TOKEN" }}'
+    homepage: https://billkit.eu
+    description: The BillKit command-line interface
+    license: Apache-2.0
+    # There is deliberately no `hooks.post.install` here any more. It used to run
+    # `xattr -dr com.apple.quarantine` on the staged binary, because unsigned
+    # binaries are refused by Gatekeeper and stripping the quarantine flag is
+    # what every unsigned cask does. The `notarize:` block above removes the
+    # reason for it: a notarized binary is accepted with the flag still on. The
+    # workaround also only ever covered Homebrew, so anyone taking the `.tar.gz`
+    # from the releases page kept getting the warning. Do not put it back to
+    # paper over a signing failure; fix the signing instead.
+
+changelog:
+  use: github
+
+release:
+  github:
+    owner: billkit-eu
+    name: billkit-cli

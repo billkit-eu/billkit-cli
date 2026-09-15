@@ -1,0 +1,119 @@
+name: Release
+
+# Triggered by pushing a tag of the form ``vX.Y.Z``. GoReleaser builds the
+# darwin/linux/windows matrix, signs and notarizes the darwin binaries with the
+# Developer ID certificate, publishes the GitHub release with checksums, and
+# pushes the Homebrew cask to billkit-eu/homebrew-tap.
+#
+# The runner stays ``ubuntu-latest`` even though the darwin binaries are signed
+# here: GoReleaser's ``notarize.macos`` uses anchore/quill, which signs Mach-O
+# binaries without codesign or a Mac. Only App Bundles, DMGs and Pkgs would need
+# a macOS runner, and this project ships none of them.
+#
+# This runs here and not upstream because the release has to exist where the tag
+# is: ``install.sh`` downloads assets from this repo's releases, ``go install``
+# resolves this module path through the public proxy, and the Homebrew cask
+# points at these URLs. The upstream monorepo is private and cannot serve any of
+# that.
+#
+# Tags are pushed by ``mise run release-sdk cli <version>`` upstream, which
+# checks the same things this job re-checks. It re-checks them because the tag is
+# the irreversible step and a published release cannot be taken back cleanly.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: GoReleaser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # GoReleaser builds the changelog from the commits since the last tag,
+          # so a shallow clone gives it nothing to read.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+
+      - name: Verify the tag matches the declared version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          DECLARED="$(sed -n 's/^var Version = "\(.*\)"$/\1/p' internal/cli/root.go | head -1)"
+          if [ -z "$DECLARED" ]; then
+            echo "::error::Could not read the declared version from internal/cli/root.go."
+            exit 1
+          fi
+          if [ "$TAG_VERSION" != "$DECLARED" ]; then
+            echo "::error::Tag ($TAG_VERSION) does not match internal/cli/root.go Version ($DECLARED)."
+            exit 1
+          fi
+
+      - name: Test
+        run: go test ./...
+
+      - name: Report the Homebrew tap state
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "::notice::No HOMEBREW_TAP_TOKEN secret, so the Homebrew cask will be skipped. The GitHub release and install.sh are unaffected. Add the secret to publish the cask to billkit-eu/homebrew-tap."
+          fi
+
+      # Same bargain as the tap token: a missing credential skips a step, it does
+      # not fail a release. But an unsigned macOS build is a user-visible
+      # regression now that the cask no longer strips the quarantine flag, so it
+      # is a warning rather than a notice, and it names every variable that is
+      # missing instead of only the first.
+      - name: Report the macOS signing state
+        env:
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+        run: |
+          missing=""
+          [ -n "$MACOS_SIGN_P12" ]         || missing="$missing MACOS_SIGN_P12"
+          [ -n "$MACOS_SIGN_PASSWORD" ]    || missing="$missing MACOS_SIGN_PASSWORD"
+          [ -n "$MACOS_NOTARY_ISSUER_ID" ] || missing="$missing MACOS_NOTARY_ISSUER_ID"
+          [ -n "$MACOS_NOTARY_KEY_ID" ]    || missing="$missing MACOS_NOTARY_KEY_ID"
+          [ -n "$MACOS_NOTARY_KEY" ]       || missing="$missing MACOS_NOTARY_KEY"
+          if [ -n "$missing" ]; then
+            echo "::warning::Skipping macOS signing and notarization; missing secrets:$missing. The release still builds and publishes, but the darwin binaries will be unsigned and macOS will refuse to run them without the user overriding Gatekeeper. Set all five secrets in this repository to fix it."
+          else
+            echo "::notice::Signing and notarizing the darwin binaries with the Developer ID Application certificate."
+          fi
+
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          version: '~> v2'
+          # `--timeout 60m` because notarization is a round trip to Apple, once
+          # per darwin binary, and GoReleaser's own default is 30m for the whole
+          # release. Without this the second submission can be killed mid-flight.
+          args: release --clean --timeout 60m
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Empty when the secret is not set, which `.goreleaser.yaml` reads as
+          # "skip the cask" rather than failing the release over it.
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # Developer ID signing + Apple notarization, read by the `notarize:`
+          # block in `.goreleaser.yaml`. Same empty-means-skip contract: all five
+          # present signs and notarizes, any one absent skips the whole step.
+          #
+          # MACOS_SIGN_P12         base64 of the Developer ID Application .p12
+          # MACOS_SIGN_PASSWORD    the password that .p12 was exported with
+          # MACOS_NOTARY_ISSUER_ID App Store Connect API issuer UUID
+          # MACOS_NOTARY_KEY_ID    App Store Connect API key ID
+          # MACOS_NOTARY_KEY       base64 of the App Store Connect .p8 key
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
