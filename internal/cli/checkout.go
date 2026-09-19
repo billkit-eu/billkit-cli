@@ -12,7 +12,13 @@ import (
 
 // oneShotMethods mirrors the API's OneShotMethod enum (schemas/one_shot_payment.py).
 // giropay was dropped when the scheme shut down at the end of 2024.
-var oneShotMethods = []string{"creditcard", "directdebit", "ideal", "bancontact", "eps"}
+//
+// This list *rejects* rather than merely documents, so it has to be kept in
+// step with the API: a method the server accepts but this slice omits is one
+// the CLI refuses on the client side, with an error that blames the user for
+// a value that is in fact valid. applepay was added in the 2026-09 wallet
+// work and is here for exactly that reason.
+var oneShotMethods = []string{"creditcard", "directdebit", "ideal", "bancontact", "eps", "applepay"}
 
 func checkoutCmd() *cobra.Command {
 	cmd := &cobra.Command{
