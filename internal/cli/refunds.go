@@ -8,16 +8,16 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func refundsCmd() *cobra.Command {
+func refundsCmd(g *globals) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "refunds",
 		Short: "Create and inspect refunds",
 	}
-	cmd.AddCommand(refundsCreateCmd(), refundsListCmd(), refundsRetrieveCmd())
+	cmd.AddCommand(refundsCreateCmd(g), refundsListCmd(g), refundsRetrieveCmd(g))
 	return cmd
 }
 
-func refundsCreateCmd() *cobra.Command {
+func refundsCreateCmd(g *globals) *cobra.Command {
 	var (
 		payment      string
 		oneShot      string
@@ -40,7 +40,7 @@ func refundsCreateCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			out, err := runMutating(cmd, mutatingCall{
+			out, err := runMutating(cmd, g, mutatingCall{
 				method:   "POST",
 				path:     "/v1/refunds",
 				body:     body,
@@ -52,7 +52,7 @@ func refundsCreateCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			printJSON(out)
+			fprintJSON(cmd.OutOrStdout(), g.color, out)
 			return nil
 		},
 	}
@@ -113,7 +113,7 @@ func describeRefund(body map[string]any) string {
 	return fmt.Sprintf("refund the full remaining balance of %s", target)
 }
 
-func refundsListCmd() *cobra.Command {
+func refundsListCmd(g *globals) *cobra.Command {
 	var (
 		limit         int
 		startingAfter string
@@ -123,7 +123,7 @@ func refundsListCmd() *cobra.Command {
 		Short: "List recent refunds",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			c, err := client()
+			c, err := client(cmd, g)
 			if err != nil {
 				return err
 			}
@@ -144,7 +144,7 @@ func refundsListCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			printJSON(out)
+			fprintJSON(cmd.OutOrStdout(), g.color, out)
 			return nil
 		},
 	}
@@ -153,13 +153,13 @@ func refundsListCmd() *cobra.Command {
 	return cmd
 }
 
-func refundsRetrieveCmd() *cobra.Command {
+func refundsRetrieveCmd(g *globals) *cobra.Command {
 	return &cobra.Command{
 		Use:   "retrieve <refund-id>",
 		Short: "Fetch one refund by id",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, err := client()
+			c, err := client(cmd, g)
 			if err != nil {
 				return err
 			}
@@ -169,7 +169,7 @@ func refundsRetrieveCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			printJSON(out)
+			fprintJSON(cmd.OutOrStdout(), g.color, out)
 			return nil
 		},
 	}

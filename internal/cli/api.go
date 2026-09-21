@@ -10,7 +10,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func apiCmd() *cobra.Command {
+func apiCmd(g *globals) *cobra.Command {
 	var (
 		dataPairs []string
 		idemKey   string
@@ -49,7 +49,7 @@ func apiCmd() *cobra.Command {
 			// the escape hatch can't quietly become the one keyless way to
 			// POST /v1/refunds.
 			if method != http.MethodGet && method != http.MethodHead {
-				out, err := runMutating(cmd, mutatingCall{
+				out, err := runMutating(cmd, g, mutatingCall{
 					method:   method,
 					path:     path,
 					body:     body,
@@ -61,11 +61,11 @@ func apiCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				printJSON(out)
+				fprintJSON(cmd.OutOrStdout(), g.color, out)
 				return nil
 			}
 
-			c, err := client()
+			c, err := client(cmd, g)
 			if err != nil {
 				return err
 			}
@@ -75,7 +75,7 @@ func apiCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			printJSON(out)
+			fprintJSON(cmd.OutOrStdout(), g.color, out)
 			return nil
 		},
 	}

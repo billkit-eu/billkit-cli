@@ -10,7 +10,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func configCmd() *cobra.Command {
+// The globals are accepted but unused: `config` reads and writes the config
+// file directly and never resolves a credential, so it has no --profile /
+// --api-key tier to consult. Taking them anyway keeps every command
+// constructor the same shape.
+func configCmd(_ *globals) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "config",
 		Short: "Inspect the CLI configuration",

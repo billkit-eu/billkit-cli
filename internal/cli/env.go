@@ -60,9 +60,9 @@ func envValue(name string) string {
 //
 // The source is a label only. The key itself is never logged, echoed, or put
 // into an error message.
-func apiKeyOverride() (key, source string) {
-	if flagAPIKey != "" {
-		return flagAPIKey, "--api-key"
+func apiKeyOverride(g *globals) (key, source string) {
+	if g.apiKey != "" {
+		return g.apiKey, "--api-key"
 	}
 	if key := envValue(envAPIKey); key != "" {
 		return key, envAPIKey
@@ -72,17 +72,17 @@ func apiKeyOverride() (key, source string) {
 
 // baseURLOverride returns the API host override, or "" to leave the choice to
 // the stored profile.
-func baseURLOverride() string {
-	if flagBaseURL != "" {
-		return flagBaseURL
+func baseURLOverride(g *globals) string {
+	if g.baseURL != "" {
+		return g.baseURL
 	}
 	return envValue(envBaseURL)
 }
 
 // profileOverride returns the stored profile to use, or "" for the default.
-func profileOverride() string {
-	if flagProfile != "" {
-		return flagProfile
+func profileOverride(g *globals) string {
+	if g.profile != "" {
+		return g.profile
 	}
 	return envValue(envProfile)
 }

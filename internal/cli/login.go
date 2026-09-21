@@ -12,7 +12,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func loginCmd() *cobra.Command {
+func loginCmd(g *globals) *cobra.Command {
 	return &cobra.Command{
 		Use:   "login",
 		Short: "Store an API key for a profile",
@@ -24,7 +24,7 @@ func loginCmd() *cobra.Command {
 			"--api-key works too but puts the secret in the process list and in your\n" +
 			"shell history, so prefer either of the other two.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			key, source := apiKeyOverride()
+			key, source := apiKeyOverride(g)
 			switch {
 			case key == "":
 				var err error
@@ -44,7 +44,7 @@ func loginCmd() *cobra.Command {
 				return fmt.Errorf("that doesn't look like a BillKit key (expected bk_test_… or bk_live_…)")
 			}
 
-			baseURL := baseURLOverride()
+			baseURL := baseURLOverride(g)
 			if baseURL == "" {
 				baseURL = config.DefaultBaseURL
 			}

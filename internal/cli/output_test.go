@@ -1,7 +1,10 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -90,23 +93,16 @@ func TestColorizeJSONColorWraps(t *testing.T) {
 }
 
 func TestColorEnabledRespectsNever(t *testing.T) {
-	prev := flagColor
-	defer func() { flagColor = prev }()
-	flagColor = "never"
-	if colorEnabled(&strings.Builder{}) {
+	if colorEnabled(&strings.Builder{}, "never") {
 		t.Fatal("never should disable color")
 	}
-	flagColor = "always"
-	if !colorEnabled(&strings.Builder{}) {
+	if !colorEnabled(&strings.Builder{}, "always") {
 		t.Fatal("always should enable color")
 	}
 }
 
 func TestColorEnabledAutoOffForNonTerminal(t *testing.T) {
-	prev := flagColor
-	defer func() { flagColor = prev }()
-	flagColor = "auto"
-	if colorEnabled(&strings.Builder{}) {
+	if colorEnabled(&strings.Builder{}, "auto") {
 		t.Fatal("auto should disable color for a non-terminal writer")
 	}
 }
@@ -124,5 +120,55 @@ func TestParseMetadata(t *testing.T) {
 	}
 	if m, _ := parseMetadata(nil); m != nil {
 		t.Fatal("empty input should yield nil map")
+	}
+}
+
+// A command's JSON goes to the writer cobra was handed, not to os.Stdout.
+//
+// This is what the fprintJSON(w, ...) shape buys: before it, every command
+// wrote straight to os.Stdout, so a test (or any caller embedding the command
+// tree) could redirect the command and still see nothing. The assertion is on
+// the plumbing, not on the API — hence the stubbed transport.
+func TestCommandJSONGoesToTheCobraWriter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"evt_1"}]}`))
+	}))
+	defer srv.Close()
+
+	g := &globals{apiKey: "bk_test_unit", baseURL: srv.URL, color: "never"}
+	cmd := eventsCmd(g)
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	cmd.SetArgs([]string{"list"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("events list: %v", err)
+	}
+
+	if !strings.Contains(out.String(), `"evt_1"`) {
+		t.Fatalf("the event JSON did not reach the command's own writer:\n%q", out.String())
+	}
+	if !json.Valid([]byte(strings.TrimSpace(out.String()))) {
+		t.Fatalf("stdout is not valid JSON:\n%s", out.String())
+	}
+	// The pre-request notices are stderr's, so stdout stays pipeable.
+	if strings.Contains(out.String(), "Using API host") {
+		t.Fatalf("a human-readable notice leaked onto stdout:\n%s", out.String())
+	}
+}
+
+// The --color mode is a value the command carries, not process state. Two
+// trees in one process must be able to disagree about it.
+func TestColorModeIsPerCommandTree(t *testing.T) {
+	var plain, painted strings.Builder
+	fprintJSON(&plain, "never", []byte(`{"a":1}`))
+	fprintJSON(&painted, "always", []byte(`{"a":1}`))
+
+	if strings.Contains(plain.String(), "\x1b[") {
+		t.Fatalf("mode=never still emitted ANSI: %q", plain.String())
+	}
+	if !strings.Contains(painted.String(), "\x1b[") {
+		t.Fatalf("mode=always emitted no ANSI: %q", painted.String())
 	}
 }

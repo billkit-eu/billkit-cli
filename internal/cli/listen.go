@@ -58,7 +58,7 @@ const (
 // for longer than the server's keep-alive interval can explain.
 var errStreamStalled = errors.New("stream stopped sending data")
 
-func listenCmd() *cobra.Command {
+func listenCmd(g *globals) *cobra.Command {
 	var forwardTo string
 	var eventsFilter string
 	var printJSON bool
@@ -72,7 +72,7 @@ func listenCmd() *cobra.Command {
 			"SDK's webhook verifier.\n\n" +
 			"  billkit listen --forward-to http://localhost:3000/billkit/webhook",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cr, err := resolve()
+			cr, err := resolve(g)
 			if err != nil {
 				return err
 			}
@@ -80,7 +80,7 @@ func listenCmd() *cobra.Command {
 			if apiKey == "" {
 				return fmt.Errorf("no API key — run `billkit login` or pass --api-key")
 			}
-			announceHost(cr)
+			announceHost(cmd.ErrOrStderr(), g, cr)
 
 			secret, err := sign.NewWebhookSecret()
 			if err != nil {
@@ -636,10 +636,18 @@ func (g *apiGapFiller) page(ctx context.Context, limit int, cursor string) ([][]
 // are ignored here; they still count as liveness one layer down, in
 // liveReader. It returns when the reader is exhausted, errors, or the context
 // is cancelled.
+//
+// Repeated `data:` lines within one frame are joined with newlines, which is
+// what the SSE spec says they mean. BillKit's stream encodes each event with
+// json.dumps and so only ever writes one, but overwriting instead of
+// appending would turn any future multi-line payload into a truncated
+// fragment that still parses as JSON often enough to be forwarded — the worst
+// available failure mode for a webhook relay.
 func consumeSSE(ctx context.Context, r io.Reader, onFrame func(context.Context, string, []byte)) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20) // up to 1 MiB per event
-	var eventName, data string
+	var eventName string
+	var data []string
 	for scanner.Scan() {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -649,12 +657,13 @@ func consumeSSE(ctx context.Context, r io.Reader, onFrame func(context.Context, 
 		case strings.HasPrefix(line, "event:"):
 			eventName = strings.TrimSpace(line[len("event:"):])
 		case strings.HasPrefix(line, "data:"):
-			data = strings.TrimSpace(line[len("data:"):])
+			data = append(data, strings.TrimSpace(line[len("data:"):]))
 		case line == "": // blank line terminates one SSE frame
-			if eventName != "" && data != "" {
-				onFrame(ctx, eventName, []byte(data))
+			payload := strings.Join(data, "\n")
+			if eventName != "" && payload != "" {
+				onFrame(ctx, eventName, []byte(payload))
 			}
-			eventName, data = "", ""
+			eventName, data = "", nil
 		}
 	}
 	return scanner.Err()

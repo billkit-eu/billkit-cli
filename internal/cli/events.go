@@ -9,7 +9,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func eventsCmd() *cobra.Command {
+func eventsCmd(g *globals) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "events",
 		Short: "Inspect the event log",
@@ -21,7 +21,7 @@ func eventsCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List recent events",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			c, err := client()
+			c, err := client(cmd, g)
 			if err != nil {
 				return err
 			}
@@ -42,7 +42,7 @@ func eventsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			printJSON(out)
+			fprintJSON(cmd.OutOrStdout(), g.color, out)
 			return nil
 		},
 	}
@@ -54,7 +54,7 @@ func eventsCmd() *cobra.Command {
 		Short: "Fetch one event by id",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, err := client()
+			c, err := client(cmd, g)
 			if err != nil {
 				return err
 			}
@@ -64,7 +64,7 @@ func eventsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			printJSON(out)
+			fprintJSON(cmd.OutOrStdout(), g.color, out)
 			return nil
 		},
 	}

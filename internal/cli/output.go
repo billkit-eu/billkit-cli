@@ -9,14 +9,11 @@ import (
 	"strings"
 )
 
-// flagColor is the global --color mode: "auto" (default), "always", or "never".
-var flagColor = "auto"
-
-// colorEnabled reports whether ANSI colour should be emitted to w. "auto"
-// (the default) colours only a real terminal, and always yields to the
-// NO_COLOR convention (https://no-color.org).
-func colorEnabled(w io.Writer) bool {
-	switch flagColor {
+// colorEnabled reports whether ANSI colour should be emitted to w under the
+// given --color mode. "auto" (the default) colours only a real terminal, and
+// always yields to the NO_COLOR convention (https://no-color.org).
+func colorEnabled(w io.Writer, mode string) bool {
+	switch mode {
 	case "always":
 		return true
 	case "never":
@@ -46,19 +43,20 @@ const (
 	ansiPunct = "\x1b[90m" // bright black (braces, commas, colons)
 )
 
-// printJSON pretty-prints a JSON byte slice to stdout, colourising when stdout
-// is a terminal. Non-JSON input is echoed verbatim.
-func printJSON(raw []byte) {
-	fprintJSON(os.Stdout, raw)
-}
-
-func fprintJSON(w io.Writer, raw []byte) {
+// fprintJSON pretty-prints a JSON byte slice to w, colourising when w is a
+// terminal. Non-JSON input is echoed verbatim.
+//
+// Commands pass cmd.OutOrStdout() rather than os.Stdout: that is the writer
+// cobra hands a test (or a caller embedding the command tree), and taking
+// os.Stdout directly made every command's own output unreachable from a test
+// that had already redirected the command.
+func fprintJSON(w io.Writer, mode string, raw []byte) {
 	if !json.Valid(bytes.TrimSpace(raw)) {
 		fmt.Fprintln(w, string(raw))
 		return
 	}
 	var sb strings.Builder
-	if err := colorizeJSON(&sb, raw, colorEnabled(w)); err != nil {
+	if err := colorizeJSON(&sb, raw, colorEnabled(w, mode)); err != nil {
 		// Fall back to plain indented output on any tokenizer hiccup.
 		var value any
 		if json.Unmarshal(raw, &value) == nil {

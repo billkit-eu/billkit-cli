@@ -41,8 +41,8 @@ type mutatingCall struct {
 //
 // Everything it prints goes to stderr, so --print-json style piping and
 // scripted output stay machine-readable on stdout.
-func runMutating(cmd *cobra.Command, call mutatingCall) ([]byte, error) {
-	c, cr, err := clientWithTimeout(writeTimeout)
+func runMutating(cmd *cobra.Command, g *globals, call mutatingCall) ([]byte, error) {
+	c, cr, err := clientWithTimeout(cmd, g, writeTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -57,9 +57,9 @@ func runMutating(cmd *cobra.Command, call mutatingCall) ([]byte, error) {
 		generated = true
 	}
 
-	announceMode(errw, cr, call)
+	announceMode(errw, cr, call, g.color)
 	announceKey(errw, key, generated)
-	if err := confirmLive(cmd, cr, call); err != nil {
+	if err := confirmLive(cmd, g, cr, call); err != nil {
 		return nil, err
 	}
 
@@ -82,7 +82,7 @@ func runMutating(cmd *cobra.Command, call mutatingCall) ([]byte, error) {
 // announceMode states which credentials are about to be used. In live mode on
 // a money command it is a banner rather than a line, because "the CLI said
 // test mode and then spent real money" is the failure this prevents.
-func announceMode(w io.Writer, cr creds, call mutatingCall) {
+func announceMode(w io.Writer, cr creds, call mutatingCall, colorMode string) {
 	mode := cr.mode
 	if mode == "" {
 		mode = "unknown-mode"
@@ -98,7 +98,7 @@ func announceMode(w io.Writer, cr creds, call mutatingCall) {
 
 	if call.moves && mode == "live" {
 		alert := func(s string) string {
-			if !colorEnabled(w) {
+			if !colorEnabled(w, colorMode) {
 				return s
 			}
 			return "\x1b[1;97;41m" + s + ansiReset
@@ -126,8 +126,8 @@ func announceKey(w io.Writer, key string, generated bool) {
 // confirmLive makes live money movement a deliberate act. On a terminal it
 // asks. Anywhere else (CI, a pipe, cron) it refuses and names the flag,
 // because a prompt nobody can answer hangs the pipeline.
-func confirmLive(cmd *cobra.Command, cr creds, call mutatingCall) error {
-	if !call.moves || cr.mode != "live" || flagYes {
+func confirmLive(cmd *cobra.Command, g *globals, cr creds, call mutatingCall) error {
+	if !call.moves || cr.mode != "live" || g.yes {
 		return nil
 	}
 	errw := cmd.ErrOrStderr()

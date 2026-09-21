@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"io"
 	"maps"
 	"slices"
 
@@ -9,7 +10,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func logoutCmd() *cobra.Command {
+func logoutCmd(g *globals) *cobra.Command {
 	var all bool
 	cmd := &cobra.Command{
 		Use:   "logout",
@@ -18,8 +19,8 @@ func logoutCmd() *cobra.Command {
 			"--profile you name (else the default profile); pass --all to remove every\n" +
 			"profile at once.",
 		Args: cobra.NoArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return runLogout(all)
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runLogout(cmd.OutOrStdout(), cmd.ErrOrStderr(), g, all)
 		},
 	}
 	cmd.Flags().BoolVar(&all, "all", false, "remove every configured profile")
@@ -31,13 +32,13 @@ func logoutCmd() *cobra.Command {
 // honours the same selector every other command does on purpose: a profile
 // that the environment has been steering every call at is the profile the user
 // means when they say "log out".
-func runLogout(all bool) error {
+func runLogout(out, errOut io.Writer, g *globals, all bool) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
 	if len(cfg.Profiles) == 0 {
-		fmt.Println("No profiles configured — nothing to log out of.")
+		fmt.Fprintln(out, "No profiles configured — nothing to log out of.")
 		return nil
 	}
 
@@ -48,11 +49,11 @@ func runLogout(all bool) error {
 		if err := cfg.Save(); err != nil {
 			return err
 		}
-		fmt.Printf("✓ Logged out of all profiles (%v).\n", names)
+		fmt.Fprintf(out, "✓ Logged out of all profiles (%v).\n", names)
 		return nil
 	}
 
-	name := profileOverride()
+	name := profileOverride(g)
 	if name == "" {
 		name = cfg.DefaultProfile
 	}
@@ -66,9 +67,9 @@ func runLogout(all bool) error {
 	if err := cfg.Save(); err != nil {
 		return err
 	}
-	fmt.Printf("✓ Logged out of the %q profile.\n", name)
+	fmt.Fprintf(out, "✓ Logged out of the %q profile.\n", name)
 	if wasDefault {
-		reportProfileAfterLogout(cfg)
+		reportProfileAfterLogout(errOut, cfg)
 	}
 	return nil
 }
@@ -80,7 +81,7 @@ func runLogout(all bool) error {
 // used to point the next command at live money. Resolve still falls back to a
 // sole remaining profile, so when one survives we name it and its mode rather
 // than implying nothing is selected.
-func reportProfileAfterLogout(cfg *config.Config) {
+func reportProfileAfterLogout(errOut io.Writer, cfg *config.Config) {
 	names := sortedProfileNames(cfg)
 	switch len(names) {
 	case 0:
@@ -89,14 +90,14 @@ func reportProfileAfterLogout(cfg *config.Config) {
 		only := names[0]
 		mode := config.Mode(cfg.Profiles[only].APIKey)
 		if mode == "live" {
-			fmt.Fprintf(stderrOut,
+			fmt.Fprintf(errOut,
 				"! %q is the only profile left, so commands will now use it. It is a LIVE key.\n"+
 					"  Log out of it too with: billkit logout --profile %s\n", only, only)
 			return
 		}
-		fmt.Fprintf(stderrOut, "> %q is the only profile left, so commands will now use it (%s mode).\n", only, mode)
+		fmt.Fprintf(errOut, "> %q is the only profile left, so commands will now use it (%s mode).\n", only, mode)
 	default:
-		fmt.Fprintf(stderrOut,
+		fmt.Fprintf(errOut,
 			"> No default profile is set. Choose one with: billkit config use <profile>\n"+
 				"  Configured: %v\n", names)
 	}

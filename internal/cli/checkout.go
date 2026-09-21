@@ -20,16 +20,16 @@ import (
 // work and is here for exactly that reason.
 var oneShotMethods = []string{"creditcard", "directdebit", "ideal", "bancontact", "eps", "applepay"}
 
-func checkoutCmd() *cobra.Command {
+func checkoutCmd(g *globals) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "checkout",
 		Short: "Create and inspect one-off (one-shot) payments",
 	}
-	cmd.AddCommand(checkoutOneShotCmd(), checkoutRetrieveCmd())
+	cmd.AddCommand(checkoutOneShotCmd(g), checkoutRetrieveCmd(g))
 	return cmd
 }
 
-func checkoutOneShotCmd() *cobra.Command {
+func checkoutOneShotCmd(g *globals) *cobra.Command {
 	var (
 		customer         string
 		amount           int64
@@ -71,7 +71,7 @@ func checkoutOneShotCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			out, err := runMutating(cmd, mutatingCall{
+			out, err := runMutating(cmd, g, mutatingCall{
 				method:   "POST",
 				path:     "/v1/checkout/one_shot",
 				body:     body,
@@ -83,7 +83,7 @@ func checkoutOneShotCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			printJSON(out)
+			fprintJSON(cmd.OutOrStdout(), g.color, out)
 			return nil
 		},
 	}
@@ -149,13 +149,13 @@ func buildOneShotBody(p oneShotParams) (map[string]any, error) {
 	return body, nil
 }
 
-func checkoutRetrieveCmd() *cobra.Command {
+func checkoutRetrieveCmd(g *globals) *cobra.Command {
 	return &cobra.Command{
 		Use:   "retrieve <one-shot-id>",
 		Short: "Fetch one one-shot payment by id",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, err := client()
+			c, err := client(cmd, g)
 			if err != nil {
 				return err
 			}
@@ -165,7 +165,7 @@ func checkoutRetrieveCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			printJSON(out)
+			fprintJSON(cmd.OutOrStdout(), g.color, out)
 			return nil
 		},
 	}

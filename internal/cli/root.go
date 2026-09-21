@@ -12,8 +12,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"sync"
 	"time"
 
 	"github.com/billkit-eu/billkit-cli/internal/api"
@@ -32,14 +30,31 @@ import (
 // version that disagrees with it, and the mirror's publish workflow re-checks
 // the pushed tag against it before GoReleaser runs. So bump it here, split, then
 // tag. See sdk/RELEASING.md.
-var Version = "0.2.1"
+var Version = "0.2.2"
 
-var (
-	flagProfile string
-	flagAPIKey  string
-	flagBaseURL string
-	flagYes     bool
-)
+// globals holds the values behind the root command's persistent flags.
+//
+// One instance is created by rootCmd() and handed to every subcommand
+// constructor. Package-level flag variables would be simpler to write and
+// wrong in the two ways that matter: two command trees in one process
+// (tests, an embedding caller) would share them, and a test that set one
+// would leak it into the next test unless it remembered to restore it —
+// which is exactly the bug class a CLI that reads credentials should not
+// be exposed to.
+type globals struct {
+	profile string
+	apiKey  string
+	baseURL string
+	color   string
+	yes     bool
+
+	// announcedHost keeps the non-default-host notice to one line per
+	// command tree. It was a package-level sync.Once, which meant a second
+	// tree in the same process stayed silent about a host the first one had
+	// already named — and that notice exists precisely so a repointed CLI
+	// cannot carry a key somewhere quietly.
+	announcedHost bool
+}
 
 // Deadlines. Reads are cheap to repeat, so they stay short. Money-moving
 // writes get far longer: the API makes a live Mollie round trip inside the
@@ -51,6 +66,7 @@ const (
 )
 
 func rootCmd() *cobra.Command {
+	g := &globals{color: "auto"}
 	root := &cobra.Command{
 		Use:   "billkit",
 		Short: "The BillKit command-line interface",
@@ -68,23 +84,23 @@ func rootCmd() *cobra.Command {
 		Version:       Version,
 	}
 
-	root.PersistentFlags().StringVar(&flagProfile, "profile", "", "config profile to use (env: BILLKIT_PROFILE; default: the configured default)")
-	root.PersistentFlags().StringVar(&flagAPIKey, "api-key", "", "API key for this call; prefer BILLKIT_API_KEY, since a flag value is visible in the process list and in shell history")
-	root.PersistentFlags().StringVar(&flagBaseURL, "base-url", "", "API host override (env: BILLKIT_BASE_URL; default: https://api.billkit.eu)")
-	root.PersistentFlags().StringVar(&flagColor, "color", "auto", "colorize JSON output: auto, always, or never")
+	root.PersistentFlags().StringVar(&g.profile, "profile", "", "config profile to use (env: BILLKIT_PROFILE; default: the configured default)")
+	root.PersistentFlags().StringVar(&g.apiKey, "api-key", "", "API key for this call; prefer BILLKIT_API_KEY, since a flag value is visible in the process list and in shell history")
+	root.PersistentFlags().StringVar(&g.baseURL, "base-url", "", "API host override (env: BILLKIT_BASE_URL; default: https://api.billkit.eu)")
+	root.PersistentFlags().StringVar(&g.color, "color", "auto", "colorize JSON output: auto, always, or never")
 	// Named to match the internal `bill` CLI's global --yes/-y.
-	root.PersistentFlags().BoolVarP(&flagYes, "yes", "y", false, "confirm live-mode money commands without prompting (required in scripts)")
+	root.PersistentFlags().BoolVarP(&g.yes, "yes", "y", false, "confirm live-mode money commands without prompting (required in scripts)")
 
 	root.AddCommand(
-		loginCmd(),
-		logoutCmd(),
-		configCmd(),
-		listenCmd(),
-		triggerCmd(),
-		eventsCmd(),
-		refundsCmd(),
-		checkoutCmd(),
-		apiCmd(),
+		loginCmd(g),
+		logoutCmd(g),
+		configCmd(g),
+		listenCmd(g),
+		triggerCmd(g),
+		eventsCmd(g),
+		refundsCmd(g),
+		checkoutCmd(g),
+		apiCmd(g),
 	)
 	return root
 }
@@ -127,10 +143,10 @@ func (c creds) isDefaultHost() bool { return c.baseURL == config.DefaultBaseURL 
 // file and a broken one cannot get in its way. The transport check below runs
 // on every tier, so a key from the environment is held to the same rule as one
 // from a flag.
-func resolve() (creds, error) {
+func resolve(g *globals) (creds, error) {
 	var out creds
-	key, keySource := apiKeyOverride()
-	baseURL := baseURLOverride()
+	key, keySource := apiKeyOverride(g)
+	baseURL := baseURLOverride(g)
 	if key != "" {
 		out = creds{apiKey: key, baseURL: baseURL, keySource: keySource}
 		if out.baseURL == "" {
@@ -141,7 +157,7 @@ func resolve() (creds, error) {
 		if err != nil {
 			return creds{}, err
 		}
-		profile, name, err := cfg.Resolve(profileOverride())
+		profile, name, err := cfg.Resolve(profileOverride(g))
 		if err != nil {
 			// The config package knows about stored profiles and nothing
 			// else, so it can only name `billkit login`. Someone hitting this
@@ -170,22 +186,22 @@ func resolve() (creds, error) {
 }
 
 // client builds an authenticated API client for a read or a routine call.
-func client() (*api.Client, error) {
-	c, _, err := clientWithTimeout(readTimeout)
+func client(cmd *cobra.Command, g *globals) (*api.Client, error) {
+	c, _, err := clientWithTimeout(cmd, g, readTimeout)
 	return c, err
 }
 
 // clientWithTimeout builds an authenticated client and reports the identity
 // it runs as, so money commands can say out loud which mode they are in.
-func clientWithTimeout(timeout time.Duration) (*api.Client, creds, error) {
-	cr, err := resolve()
+func clientWithTimeout(cmd *cobra.Command, g *globals, timeout time.Duration) (*api.Client, creds, error) {
+	cr, err := resolve(g)
 	if err != nil {
 		return nil, creds{}, err
 	}
 	if cr.apiKey == "" {
 		return nil, creds{}, fmt.Errorf("no API key: run `billkit login`, or set %s (preferred in scripts), or pass --api-key", envAPIKey)
 	}
-	announceHost(cr)
+	announceHost(cmd.ErrOrStderr(), g, cr)
 	// The transport cap sits just above the per-call context deadline so the
 	// context is what fires, and the error names the deadline the user can
 	// reason about.
@@ -201,21 +217,18 @@ func newHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{Timeout: timeout, Transport: transportOverride}
 }
 
-// hostOnce keeps the non-default-host notice to one line per process.
-var hostOnce sync.Once
-
-// stderrOut is where the pre-request notices go. It is a variable only so
-// tests can read what a user would see.
-var stderrOut io.Writer = os.Stderr
-
-// announceHost says out loud, once, when the CLI is pointed somewhere other
-// than the official API. A repointed CLI should announce itself rather than
-// quietly carry the key off to a host the user did not expect.
-func announceHost(cr creds) {
-	if cr.isDefaultHost() {
+// announceHost says out loud, once per command tree, when the CLI is pointed
+// somewhere other than the official API. A repointed CLI should announce
+// itself rather than quietly carry the key off to a host the user did not
+// expect.
+//
+// It writes to the command's own error stream, not os.Stderr, so the notice
+// lands wherever the caller redirected the command — which is also what makes
+// it assertable without swapping a package variable out from under the test.
+func announceHost(w io.Writer, g *globals, cr creds) {
+	if cr.isDefaultHost() || g.announcedHost {
 		return
 	}
-	hostOnce.Do(func() {
-		fmt.Fprintf(stderrOut, "> Using API host %s\n", cr.baseURL)
-	})
+	g.announcedHost = true
+	fmt.Fprintf(w, "> Using API host %s\n", cr.baseURL)
 }

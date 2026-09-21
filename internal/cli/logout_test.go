@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"io"
 	"strings"
 	"testing"
 
@@ -17,8 +18,7 @@ func TestLogoutDefaultProfile(t *testing.T) {
 	}, "test")
 
 	// No --profile, no --all → removes the default ("test").
-	flagProfile = ""
-	if err := runLogout(false); err != nil {
+	if err := runLogout(io.Discard, io.Discard, &globals{}, false); err != nil {
 		t.Fatal(err)
 	}
 	cfg, _ := config.Load()
@@ -45,8 +45,7 @@ func TestLogoutNeverPromotesLive(t *testing.T) {
 		"staging": {APIKey: "bk_test_z"},
 	}, "test")
 
-	flagProfile = ""
-	if err := runLogout(false); err != nil {
+	if err := runLogout(io.Discard, io.Discard, &globals{}, false); err != nil {
 		t.Fatal(err)
 	}
 	cfg, _ := config.Load()
@@ -70,12 +69,7 @@ func TestLogoutAnnouncesASoleLiveSurvivor(t *testing.T) {
 	}, "test")
 
 	var errBuf bytes.Buffer
-	prev := stderrOut
-	stderrOut = &errBuf
-	t.Cleanup(func() { stderrOut = prev })
-
-	flagProfile = ""
-	if err := runLogout(false); err != nil {
+	if err := runLogout(io.Discard, &errBuf, &globals{}, false); err != nil {
 		t.Fatal(err)
 	}
 	got := errBuf.String()
@@ -92,8 +86,7 @@ func TestLogoutAll(t *testing.T) {
 		"live": {APIKey: "bk_live_y"},
 	}, "test")
 
-	flagProfile = ""
-	if err := runLogout(true); err != nil {
+	if err := runLogout(io.Discard, io.Discard, &globals{}, true); err != nil {
 		t.Fatal(err)
 	}
 	cfg, _ := config.Load()
@@ -110,9 +103,7 @@ func TestLogoutNamedProfile(t *testing.T) {
 		"live": {APIKey: "bk_live_y"},
 	}, "test")
 
-	flagProfile = "live"
-	defer func() { flagProfile = "" }()
-	if err := runLogout(false); err != nil {
+	if err := runLogout(io.Discard, io.Discard, &globals{profile: "live"}, false); err != nil {
 		t.Fatal(err)
 	}
 	cfg, _ := config.Load()
@@ -129,9 +120,7 @@ func TestLogoutUnknownProfile(t *testing.T) {
 	t.Setenv("BILLKIT_CONFIG_HOME", dir)
 	seedProfiles(t, map[string]config.Profile{"test": {APIKey: "bk_test_x"}}, "test")
 
-	flagProfile = "nope"
-	defer func() { flagProfile = "" }()
-	if err := runLogout(false); err == nil {
+	if err := runLogout(io.Discard, io.Discard, &globals{profile: "nope"}, false); err == nil {
 		t.Fatal("expected an error for an unknown profile")
 	}
 }

@@ -361,24 +361,38 @@ func TestTestKeyOverPlainHTTPRemoteIsRefused(t *testing.T) {
 // TestNonDefaultHostIsAnnounced: a repointed CLI should say so rather than
 // quietly carrying the key somewhere the user did not expect.
 func TestNonDefaultHostIsAnnounced(t *testing.T) {
-	var notices bytes.Buffer
-	hostOnce = sync.Once{}
-	prev := stderrOut
-	stderrOut = &notices
-	t.Cleanup(func() {
-		stderrOut = prev
-		hostOnce = sync.Once{}
-	})
-
 	rec := &recorder{}
 	srv := httptest.NewServer(rec.handler())
 	defer srv.Close()
 
-	if _, err := runCLI(t, "refunds", "list", "--api-key", "bk_test_x", "--base-url", srv.URL); err != nil {
+	// No package state to swap: the notice goes to the command's own error
+	// stream, which runCLI already captures.
+	notices, err := runCLI(t, "refunds", "list", "--api-key", "bk_test_x", "--base-url", srv.URL)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(notices.String(), srv.URL) {
-		t.Fatalf("a non-default API host must be announced; stderr = %q", notices.String())
+	if !strings.Contains(notices, srv.URL) {
+		t.Fatalf("a non-default API host must be announced; stderr = %q", notices)
+	}
+}
+
+// Two command trees in one process each announce a non-default host. The
+// package-level sync.Once this replaced let the second tree stay silent about
+// a host the first had already named, which is the one thing the notice is
+// there to prevent.
+func TestHostAnnouncementIsPerCommandTree(t *testing.T) {
+	rec := &recorder{}
+	srv := httptest.NewServer(rec.handler())
+	defer srv.Close()
+
+	for i := range 2 {
+		notices, err := runCLI(t, "refunds", "list", "--api-key", "bk_test_x", "--base-url", srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(notices, srv.URL) {
+			t.Fatalf("tree %d did not announce the host; stderr = %q", i, notices)
+		}
 	}
 }
 

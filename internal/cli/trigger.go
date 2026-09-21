@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"os"
 	"sort"
 	"time"
 
@@ -44,7 +43,7 @@ var triggers = map[string]func(ctx context.Context, c *api.Client) ([]byte, erro
 	},
 }
 
-func triggerCmd() *cobra.Command {
+func triggerCmd(g *globals) *cobra.Command {
 	return &cobra.Command{
 		Use:   "trigger [event-type]",
 		Short: "Fire a test event by making the real API call that emits it",
@@ -66,7 +65,7 @@ func triggerCmd() *cobra.Command {
 				return fmt.Errorf("unsupported trigger %q — run `billkit trigger` to list supported events", args[0])
 			}
 
-			c, err := client()
+			c, err := client(cmd, g)
 			if err != nil {
 				return err
 			}
@@ -81,8 +80,8 @@ func triggerCmd() *cobra.Command {
 				return err
 			}
 
-			fmt.Fprintf(os.Stderr, "Triggered %s\n", args[0])
-			printJSON(out)
+			fmt.Fprintf(cmd.ErrOrStderr(), "Triggered %s\n", args[0])
+			fprintJSON(cmd.OutOrStdout(), g.color, out)
 			return nil
 		},
 	}
