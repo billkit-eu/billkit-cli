@@ -117,6 +117,19 @@ func listenCmd() *cobra.Command {
 				logOut: logOut,
 			}
 
+			// Fail here rather than after a round trip. The server rejects
+			// an unknown type too, but a developer running this against a
+			// long-lived stream should learn about a typo before the
+			// connection is made, not from a 400 buried in reconnect output.
+			if unknown := validateEventTypes(eventsFilter); len(unknown) > 0 {
+				return fmt.Errorf(
+					"unknown event type(s) in --events: %s\n"+
+						"Omit --events to receive every event, or run "+
+						"`billkit api GET /v1/webhook_endpoints/event_types` for the %d available",
+					strings.Join(unknown, ", "), len(knownEventTypes),
+				)
+			}
+
 			l := newListener(baseURL, apiKey, eventsFilter, fwd, errw)
 			l.fill = &apiGapFiller{
 				client: api.New(baseURL, apiKey, Version, newHTTPClient(readTimeout+5*time.Second)),
