@@ -30,7 +30,7 @@ import (
 // version that disagrees with it, and the mirror's publish workflow re-checks
 // the pushed tag against it before GoReleaser runs. So bump it here, split, then
 // tag. See sdk/RELEASING.md.
-var Version = "0.2.3"
+var Version = "0.2.4"
 
 // globals holds the values behind the root command's persistent flags.
 //

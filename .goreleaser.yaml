@@ -6,8 +6,10 @@
 # mirror's own `.github/workflows/publish.yml` (installed by the split, from
 # sdk/scripts/split-templates/cli/) is what invokes this file on a `v*` tag.
 #
-# NOTE: not yet exercised by a real release. Before the first tag, validate with
-# `goreleaser check` and a `goreleaser release --snapshot --clean`.
+# Before a tag, validate with `goreleaser check` and a `goreleaser release
+# --snapshot --clean`. Be aware that a snapshot does NOT exercise the publish
+# pipe, so it cannot catch a bad `homebrew_casks.repository.token`; see the note
+# on that field.
 #
 # The macOS signing and notarization credentials are documented on the
 # `notarize:` block below, and mirrored in cli/README.md under "Signing and
@@ -135,16 +137,27 @@ homebrew_casks:
     # failure reads as though the release failed. So the step is skipped unless
     # `HOMEBREW_TAP_TOKEN` is set, and publish.yml prints a notice when it is not.
     #
-    # `index .Env "..."` rather than `.Env.HOMEBREW_TAP_TOKEN`, because the dotted
-    # form is a hard error when the name is absent from the environment entirely
-    # ("map has no entry for key"), and absent is the normal state on a laptop.
-    # `index` returns an empty string instead, which is the condition we want to
-    # test. Verified both ways with `goreleaser release --snapshot`.
+    # `skip_upload` uses `index .Env "..."` rather than `.Env.HOMEBREW_TAP_TOKEN`,
+    # because the dotted form is a hard error when the name is absent from the
+    # environment entirely ("map has no entry for key"), and absent is the normal
+    # state on a laptop. `index` returns an empty string instead, which is the
+    # condition we want to test.
+    #
+    # `token` below is the exception and MUST be the dotted form. GoReleaser does
+    # not template it like any other field: it runs `ApplySingleEnvOnly`, which
+    # matches `^{{\s*\.Env\.[^.\s}]+\s*}}$` and rejects everything else with
+    # "expected {{ .Env.VAR_NAME }} only (no plain-text or other interpolation)".
+    # The `index` form failed v0.2.3 there, after the GitHub release had already
+    # published. It is safe on a laptop regardless, because `doPublish` returns on
+    # `skip_upload` before it ever resolves the token
+    # (internal/pipe/cask/cask.go: the skip check is ~35 lines above the
+    # `client.NewIfToken` call). Snapshot runs never reach the publish pipe at
+    # all, which is why `goreleaser release --snapshot` could not catch this.
     skip_upload: '{{ if index .Env "HOMEBREW_TAP_TOKEN" }}false{{ else }}true{{ end }}'
     repository:
       owner: billkit-eu
       name: homebrew-tap
-      token: '{{ index .Env "HOMEBREW_TAP_TOKEN" }}'
+      token: '{{ .Env.HOMEBREW_TAP_TOKEN }}'
     homepage: https://billkit.eu
     description: The BillKit command-line interface
     license: Apache-2.0
