@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -38,20 +37,9 @@ const (
 	// streamHeaderTimeout catches the other stall: a host that accepts the
 	// TCP connection and then never answers at all.
 	streamHeaderTimeout = 30 * time.Second
-	// streamSettleDelay is how long to wait after the stream's response
-	// headers arrive before asking the event log what was missed. The server
-	// picks the stream's cursor just after it writes those headers, so a
-	// backfill issued in the same instant can race it. Waiting makes the two
-	// windows overlap instead, and the overlap is dropped by event id.
-	streamSettleDelay = 250 * time.Millisecond
 	// streamStableFor is how long one connection must survive before the
 	// reconnect backoff counts as recovered and resets to its floor.
 	streamStableFor = 30 * time.Second
-	// gapReplayPages caps a replay at gapReplayPages * gapPageSize events, so
-	// a laptop that slept all weekend does not fire thousands of webhooks at
-	// a local dev server. Anything past the cap is reported, not swallowed.
-	gapReplayPages = 5
-	gapPageSize    = 100
 )
 
 // errStreamStalled is an established connection that stopped producing bytes
@@ -72,6 +60,30 @@ func listenCmd(g *globals) *cobra.Command {
 			"SDK's webhook verifier.\n\n" +
 			"  billkit listen --forward-to http://localhost:3000/billkit/webhook",
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			// Flags first, before any credential is read or any host is
+			// named. A mistyped flag is the user's to fix either way, and
+			// reporting it after "> Using API host …" reads as though the
+			// connection is what went wrong.
+			//
+			// --forward-to with no scheme ("localhost:3000/hook") is refused
+			// by http.NewRequest on every single event, and a per-event
+			// "build error" line reads as a broken webhook handler rather
+			// than as a mistyped flag.
+			if err := validateForwardURL(forwardTo); err != nil {
+				return err
+			}
+			// The server rejects an unknown event type too, but a developer
+			// opening a long-lived stream should learn about a typo now, not
+			// from a 400 buried in reconnect output.
+			if unknown := validateEventTypes(eventsFilter); len(unknown) > 0 {
+				return fmt.Errorf(
+					"unknown event type(s) in --events: %s\n"+
+						"Omit --events to receive every event, or run "+
+						"`billkit api GET /v1/webhook_endpoints/event_types` for the %d available",
+					strings.Join(unknown, ", "), len(knownEventTypes),
+				)
+			}
+
 			cr, err := resolve(g)
 			if err != nil {
 				return err
@@ -117,21 +129,8 @@ func listenCmd(g *globals) *cobra.Command {
 				logOut: logOut,
 			}
 
-			// Fail here rather than after a round trip. The server rejects
-			// an unknown type too, but a developer running this against a
-			// long-lived stream should learn about a typo before the
-			// connection is made, not from a 400 buried in reconnect output.
-			if unknown := validateEventTypes(eventsFilter); len(unknown) > 0 {
-				return fmt.Errorf(
-					"unknown event type(s) in --events: %s\n"+
-						"Omit --events to receive every event, or run "+
-						"`billkit api GET /v1/webhook_endpoints/event_types` for the %d available",
-					strings.Join(unknown, ", "), len(knownEventTypes),
-				)
-			}
-
 			l := newListener(baseURL, apiKey, eventsFilter, fwd, errw)
-			l.fill = &apiGapFiller{
+			l.anchor = &apiEventAnchor{
 				client: api.New(baseURL, apiKey, Version, newHTTPClient(readTimeout+5*time.Second)),
 			}
 			return l.run(ctx)
@@ -144,34 +143,34 @@ func listenCmd(g *globals) *cobra.Command {
 }
 
 // listener owns one `billkit listen` session: the reconnect loop, the stall
-// watchdog, and the replay of the events a reconnect would otherwise skip.
+// watchdog, and the resume cursor that makes a reconnect gapless.
 type listener struct {
 	baseURL string
 	apiKey  string
 	types   string
 	fwd     *forwarder
 	stream  *http.Client
-	// fill reads the events missed between two connections. Nil disables
-	// replay, which is honest but lossy, so the loop says so out loud.
-	fill   gapFiller
+	// anchor reads the newest event id once, before the first connection,
+	// so a reconnect that happens before anything has arrived still has a
+	// resume point. Nil disables that seeding, which is honest but lossy, so
+	// the loop says so out loud.
+	anchor eventAnchor
 	errOut io.Writer
 
 	// Tunables. Fields rather than constants so the tests can drive the real
 	// loop in milliseconds instead of minutes.
 	stallTimeout time.Duration
 	stallStep    time.Duration
-	settle       time.Duration
 	stableFor    time.Duration
 	// wait pauses between reconnects. A seam so a test can observe the
 	// backoff curve without sleeping through it.
 	wait func(ctx context.Context, attempt int, retryAfter time.Duration) bool
 
-	// Resume position: the newest event already handed to the forwarder.
-	lastID      string
-	lastCreated int64
-	// replayed holds the ids this attempt's replay already delivered, so the
-	// overlap the live stream repeats is dropped rather than forwarded twice.
-	replayed map[string]bool
+	// resumeAfter is the id of the newest event already handed to the
+	// forwarder, and it is the whole of the CLI's gap handling: it goes back
+	// as `starting_after`, and the server replays everything recorded after
+	// it, in order and under the same `types` filter, before going live.
+	resumeAfter string
 }
 
 func newListener(baseURL, apiKey, types string, fwd *forwarder, errOut io.Writer) *listener {
@@ -184,7 +183,6 @@ func newListener(baseURL, apiKey, types string, fwd *forwarder, errOut io.Writer
 		errOut:       errOut,
 		stallTimeout: streamStallTimeout,
 		stallStep:    streamStallCheckStep,
-		settle:       streamSettleDelay,
 		stableFor:    streamStableFor,
 	}
 	l.wait = l.defaultWait
@@ -206,6 +204,12 @@ func newStreamHTTPClient() *http.Client {
 	}
 	tr := base.Clone()
 	tr.ResponseHeaderTimeout = streamHeaderTimeout
+	// No transparent gzip on a stream. Go's automatic decompression is fine
+	// for a response that ends, but an intermediary that gzips an SSE feed
+	// buffers frames until it has a block worth compressing, so events
+	// arrive in clumps, and a quiet period looks to the stall watchdog like
+	// a dead socket while bytes are in fact sitting in a proxy.
+	tr.DisableCompression = true
 	return &http.Client{Transport: tr}
 }
 
@@ -218,7 +222,7 @@ func newStreamHTTPClient() *http.Client {
 // Everything else is transient and is retried on the same exponential
 // backoff the API client uses.
 func (l *listener) run(ctx context.Context) error {
-	l.anchor(ctx)
+	l.seedResume(ctx)
 
 	var lastErr error
 	attempt := 0
@@ -241,14 +245,26 @@ func (l *listener) run(ctx context.Context) error {
 
 		if err != nil {
 			var status *streamStatusError
-			if errors.As(err, &status) && status.fatal() {
+			isStatus := errors.As(err, &status)
+			switch {
+			case isStatus && l.resumeAfter != "" && status.staleCursor():
+				// Not fatal, even though it is a 4xx: the request is only
+				// wrong because of a cursor this loop owns and can drop.
+				// Exiting here would kill a listener that has been running
+				// for days over an event that aged out of the log.
+				fmt.Fprintf(l.errOut, "! The resume point %s is no longer in the event log, so anything recorded since then was not replayed.\n", l.resumeAfter)
+				fmt.Fprintln(l.errOut, "!   Reconcile with: billkit events list")
+				l.resumeAfter = ""
+				lastErr = err
+			case isStatus && status.fatal():
 				if hint := status.hint(); hint != "" {
 					fmt.Fprintf(l.errOut, "! %s\n", hint)
 				}
 				return fmt.Errorf("the event stream refused the connection: %w", err)
+			default:
+				lastErr = err
+				fmt.Fprintf(l.errOut, "! Stream error: %v. Reconnecting.\n", err)
 			}
-			lastErr = err
-			fmt.Fprintf(l.errOut, "! Stream error: %v. Reconnecting.\n", err)
 		}
 
 		// A connection that lasted counts as recovery, so a stream that
@@ -278,17 +294,22 @@ func (l *listener) defaultWait(ctx context.Context, attempt int, retryAfter time
 	return api.SleepFor(ctx, api.Backoff(attempt, retryAfter))
 }
 
-// anchor seeds the resume cursor from the newest event that already exists,
-// so a reconnect that happens before the first live event still knows where
-// to resume from. Failure is silent on purpose: the stream needs the same
-// scope, so a real permission problem is about to be reported properly, and
-// a transient blip is reported later by fillGap if it ever matters.
-func (l *listener) anchor(ctx context.Context) {
-	if l.fill == nil {
+// seedResume reads the newest event that already exists, so a reconnect
+// happening before the first live event still knows where to resume from.
+// Without it, the window between start-up and the first delivered event is
+// the one gap `starting_after` cannot close, because there is no id yet.
+//
+// Failure is silent on purpose: the stream needs the same events:read scope,
+// so a real permission problem is about to be reported properly by the
+// connection itself, and a transient blip costs only the seed — which the
+// first delivered event replaces anyway, and whose absence the reconnect
+// notice says out loud.
+func (l *listener) seedResume(ctx context.Context) {
+	if l.anchor == nil {
 		return
 	}
-	if id, created, err := l.fill.newest(ctx); err == nil {
-		l.lastID, l.lastCreated = id, created
+	if id, err := l.anchor.newest(ctx); err == nil {
+		l.resumeAfter = id
 	}
 }
 
@@ -303,8 +324,21 @@ func (l *listener) streamOnce(ctx context.Context, reconnect bool) (bool, error)
 	defer cancel()
 
 	endpoint := l.baseURL + "/v1/events/stream"
+	q := url.Values{}
 	if l.types != "" {
-		endpoint += "?types=" + url.QueryEscape(l.types)
+		q.Set("types", l.types)
+	}
+	// The resume cursor. GET /v1/events/stream replays everything recorded
+	// after this id, in order and under the same types filter, before it goes
+	// live — which is why this CLI no longer walks GET /v1/events itself. The
+	// backfill it used to do was capped at 500 events, and it read the event
+	// log unfiltered, so every reconnect under --events forwarded event types
+	// the user had explicitly excluded.
+	if l.resumeAfter != "" {
+		q.Set("starting_after", l.resumeAfter)
+	}
+	if encoded := q.Encode(); encoded != "" {
+		endpoint += "?" + encoded
 	}
 	req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -328,7 +362,7 @@ func (l *listener) streamOnce(ctx context.Context, reconnect bool) (bool, error)
 		}
 	}
 
-	l.fillGap(attemptCtx, reconnect)
+	l.announceResume(reconnect)
 
 	live := &liveReader{r: resp.Body}
 	live.mark()
@@ -345,98 +379,77 @@ func (l *listener) streamOnce(ctx context.Context, reconnect bool) (bool, error)
 // onFrame routes one parsed SSE frame. The server's idle-ceiling "timeout"
 // frame is announced rather than dropped: an unexplained reconnect once an
 // hour is exactly the silence that makes a developer distrust the tool.
-func (l *listener) onFrame(ctx context.Context, event string, data []byte) {
-	switch event {
+func (l *listener) onFrame(ctx context.Context, f sseFrame) {
+	if f.dropped > 0 {
+		l.reportOversized(f)
+		return
+	}
+	switch f.event {
 	case "message":
-		l.deliver(ctx, data)
+		l.deliver(ctx, f.data)
 	case "timeout":
 		fmt.Fprintln(l.errOut, "> The server closed the idle stream. Reconnecting.")
 	}
 }
 
-// deliver forwards one live event and advances the resume cursor, skipping
-// anything the replay already handed over a moment ago.
-func (l *listener) deliver(ctx context.Context, raw []byte) {
-	id, created := eventMeta(raw)
-	if id != "" {
-		if l.replayed[id] {
-			delete(l.replayed, id)
-			return
-		}
-		l.advance(id, created)
-	}
-	l.fwd.handle(ctx, raw)
-}
-
-// advance moves the resume cursor forward, and only forward. `listen` is a
-// tail, not a history dump: a cursor that could move backwards would make the
-// next reconnect replay events from before the point the user started
-// listening.
-func (l *listener) advance(id string, created int64) {
-	if id == "" || created < l.lastCreated {
-		return
-	}
-	l.lastID, l.lastCreated = id, created
-}
-
-// fillGap replays the events created since the last one forwarded.
+// reportOversized handles an event too large to buffer: it names it, says
+// where to read it, and moves the cursor past it.
 //
-// GET /v1/events/stream takes no resume cursor and re-anchors to the newest
-// event every time it is opened, so the replay has to come from the event
-// log instead. Whatever cannot be replayed is said out loud and paired with
-// the command that reconciles it: a listener that silently skips events is
-// worse than one that admits it, because the developer debugs their own app
-// for hours instead.
-func (l *listener) fillGap(ctx context.Context, reconnect bool) {
-	l.replayed = nil
-	if l.fill == nil || l.lastID == "" {
-		if reconnect {
-			fmt.Fprintln(l.errOut, "! Reconnected with no resume point, so events emitted while the stream was down were not replayed.")
-			fmt.Fprintln(l.errOut, "!   Reconcile with: billkit events list")
-		}
-		return
+// Skipping is the only option that terminates. The frame cannot be parsed, so
+// it cannot be signed or forwarded; and since the resume cursor makes the
+// server replay from the last event delivered, failing the connection would
+// fetch the same oversized row on every reconnect, forever, at an ever-longer
+// backoff. That is a listener that looks alive and has stopped working.
+//
+// Advancing the cursor past an event that was never forwarded is a real loss,
+// which is why it is reported with the command that reads it rather than
+// logged and forgotten. The id comes from the frame's `id:` field, which the
+// server writes before the payload, so it survives even when the payload does
+// not.
+func (l *listener) reportOversized(f sseFrame) {
+	id := f.id
+	if id == "" {
+		id = "(no id)"
 	}
-	if !api.SleepFor(ctx, l.settle) {
-		return
+	fmt.Fprintf(l.errOut,
+		"! Event %s is larger than the %d MiB this CLI buffers per event (at least %d byte(s) over), so it was NOT forwarded.\n",
+		id, maxSSEFrameBytes>>20, f.dropped)
+	if f.id != "" {
+		fmt.Fprintf(l.errOut, "!   Read it with: billkit events retrieve %s\n", f.id)
+		// Past it, so the next reconnect does not replay the same row and
+		// stall here again.
+		l.resumeAfter = f.id
+	} else {
+		fmt.Fprintln(l.errOut, "!   Reconcile with: billkit events list")
 	}
+}
 
-	events, truncated, err := l.fill.eventsAfter(ctx, l.lastID, l.lastCreated)
-	if err != nil {
-		if ctx.Err() != nil {
-			return
-		}
-		fmt.Fprintf(l.errOut, "! Could not read the events missed while the stream was down: %v\n", err)
+// deliver forwards one event and advances the resume cursor past it.
+//
+// The cursor moves after the forward, not before, so it always means "already
+// handed over". There is no de-duplication left to do: the server delivers
+// each event once per connection and resumes strictly after the cursor, so
+// the overlap the old client-side backfill had to filter cannot occur.
+func (l *listener) deliver(ctx context.Context, raw []byte) {
+	l.fwd.handle(ctx, raw)
+	if id := eventID(raw); id != "" {
+		l.resumeAfter = id
+	}
+}
+
+// announceResume says what this connection is going to do about the gap
+// before it, because a reconnect that silently skips events is the failure
+// that has the developer debugging their own app for hours.
+func (l *listener) announceResume(reconnect bool) {
+	if !reconnect {
+		return
+	}
+	if l.resumeAfter == "" {
+		fmt.Fprintln(l.errOut, "! Reconnected with no resume point, so events emitted while the stream was down were not replayed.")
 		fmt.Fprintln(l.errOut, "!   Reconcile with: billkit events list")
 		return
 	}
-	if truncated {
-		fmt.Fprintf(l.errOut, "! The gap was longer than %d events, so only the most recent %d are replayed.\n", gapReplayPages*gapPageSize, len(events))
-		fmt.Fprintln(l.errOut, "!   Reconcile the rest with: billkit events list")
-	}
-	switch {
-	case reconnect && len(events) == 0:
-		fmt.Fprintln(l.errOut, "> Reconnected. No events were missed.")
-	case reconnect:
-		fmt.Fprintf(l.errOut, "> Reconnected. Replaying %d event(s) that arrived while the stream was down.\n", len(events))
-	case len(events) > 0:
-		// The first connection closes the window between reading the resume
-		// point and the stream opening. Rare, but never silent: an event the
-		// user did not expect to see is still better explained than not.
-		fmt.Fprintf(l.errOut, "> Replaying %d event(s) created while the stream was opening.\n", len(events))
-	}
-
-	l.replayed = make(map[string]bool, len(events))
-	for _, raw := range events {
-		if ctx.Err() != nil {
-			return
-		}
-		id, created := eventMeta(raw)
-		l.advance(id, created)
-		l.fwd.handle(ctx, raw)
-		if id != "" {
-			l.replayed[id] = true
-		}
-	}
+	fmt.Fprintf(l.errOut, "> Reconnected. Replaying anything recorded after %s.\n", l.resumeAfter)
 }
 
 // streamStatusError is a non-200 answer from GET /v1/events/stream.
@@ -470,6 +483,21 @@ func (e *streamStatusError) fatal() bool {
 		return false
 	}
 	return e.status >= 400 && e.status < 500
+}
+
+// staleCursor reports whether the server refused the resume point itself.
+// An event id ages out of the log (api/billkit/workers/retention.py prunes
+// it), and from then on every reconnect carrying it gets the same 400. It is
+// the one 4xx the loop does not treat as fatal, because dropping the cursor
+// makes the very next attempt valid — lossy, and said out loud, but alive.
+//
+// Keyed on the envelope's `param`, so a 400 about the `types` filter still
+// ends the command rather than being retried forever without its cursor.
+func (e *streamStatusError) staleCursor() bool {
+	if e.status != http.StatusBadRequest || e.body == "" {
+		return false
+	}
+	return api.ParseError(e.status, []byte(e.body)).Param == "starting_after"
 }
 
 // hint names the thing the user can actually change, because "HTTP 403" on
@@ -553,89 +581,68 @@ func (l *listener) watchStall(ctx context.Context, live *liveReader, cancel cont
 	return w
 }
 
-// gapFiller reads the events a reconnect would otherwise skip.
-type gapFiller interface {
-	// newest returns the id and creation time of the most recent event, or
-	// an empty id when the log holds none yet.
-	newest(ctx context.Context) (string, int64, error)
-	// eventsAfter returns the events created after the given position,
-	// oldest first. truncated reports that the gap ran longer than the CLI
-	// is willing to replay in one go.
-	eventsAfter(ctx context.Context, lastID string, lastCreated int64) (events [][]byte, truncated bool, err error)
+// eventAnchor reads the newest event already recorded, which is where a
+// listener that has not received anything yet resumes from.
+type eventAnchor interface {
+	newest(ctx context.Context) (string, error)
 }
 
-// apiGapFiller walks GET /v1/events, which is ordered newest first and
-// cursor-paginated by `starting_after`, and needs the same `events:read`
-// scope the stream already required.
-type apiGapFiller struct{ client *api.Client }
+// apiEventAnchor reads GET /v1/events, which is ordered newest first and
+// needs the same events:read scope the stream already required. It asks for
+// one row and ignores the types filter on purpose: the answer is a cursor,
+// and the server re-applies the filter to everything it replays after it.
+type apiEventAnchor struct{ client *api.Client }
 
-func (g *apiGapFiller) newest(ctx context.Context) (string, int64, error) {
-	page, _, err := g.page(ctx, 1, "")
-	if err != nil || len(page) == 0 {
-		return "", 0, err
-	}
-	id, created := eventMeta(page[0])
-	return id, created, nil
-}
-
-func (g *apiGapFiller) eventsAfter(ctx context.Context, lastID string, lastCreated int64) ([][]byte, bool, error) {
-	var newer [][]byte
-	cursor := ""
-	for range gapReplayPages {
-		page, hasMore, err := g.page(ctx, gapPageSize, cursor)
-		if err != nil {
-			return nil, false, err
-		}
-		for _, raw := range page {
-			id, created := eventMeta(raw)
-			// The log is ordered (created desc, id desc), so either landmark
-			// ends the walk: the exact event last forwarded, or the first
-			// event older than it, in case that row has since been pruned.
-			if id == lastID || created < lastCreated {
-				slices.Reverse(newer)
-				return newer, false, nil
-			}
-			newer = append(newer, raw)
-			cursor = id
-		}
-		if !hasMore || cursor == "" {
-			slices.Reverse(newer)
-			return newer, false, nil
-		}
-	}
-	slices.Reverse(newer)
-	return newer, true, nil
-}
-
-func (g *apiGapFiller) page(ctx context.Context, limit int, cursor string) ([][]byte, bool, error) {
-	q := url.Values{}
-	q.Set("limit", strconv.Itoa(limit))
-	if cursor != "" {
-		q.Set("starting_after", cursor)
-	}
-	raw, err := g.client.Do(ctx, http.MethodGet, "/v1/events?"+q.Encode(), nil)
+func (a *apiEventAnchor) newest(ctx context.Context) (string, error) {
+	raw, err := a.client.Do(ctx, http.MethodGet, "/v1/events?limit=1", nil)
 	if err != nil {
-		return nil, false, err
+		return "", err
 	}
 	var env struct {
-		Data    []json.RawMessage `json:"data"`
-		HasMore bool              `json:"has_more"`
+		Data []json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, false, fmt.Errorf("could not read the event log: %w", err)
+		return "", fmt.Errorf("could not read the event log: %w", err)
 	}
-	out := make([][]byte, len(env.Data))
-	for i, item := range env.Data {
-		out[i] = item
+	if len(env.Data) == 0 {
+		return "", nil
 	}
-	return out, env.HasMore, nil
+	return eventID(env.Data[0]), nil
 }
 
-// consumeSSE parses a text/event-stream and invokes onFrame with the name and
-// raw data of each complete frame. ":" keep-alive comments carry no frame and
-// are ignored here; they still count as liveness one layer down, in
-// liveReader. It returns when the reader is exhausted, errors, or the context
-// is cancelled.
+// SSE reading limits.
+const (
+	// sseReadBuffer is the working buffer for one line. Lines longer than it
+	// are read in pieces rather than failing, so it is a throughput knob and
+	// not a ceiling.
+	sseReadBuffer = 64 * 1024
+	// maxSSEFrameBytes is the most event payload the CLI will hold in memory
+	// for one frame. A BillKit event is a resource snapshot with a bounded
+	// metadata bag, so this is far above anything the API emits; it exists so
+	// a pathological or hostile payload cannot exhaust memory on a developer
+	// laptop.
+	maxSSEFrameBytes = 1 << 20 // 1 MiB
+)
+
+// sseFrame is one complete frame off the stream.
+type sseFrame struct {
+	// id is the frame's `id:` field, which for BillKit is the event id. The
+	// server writes it before the payload, so it identifies a frame whose
+	// data was too large to keep.
+	id    string
+	event string
+	data  []byte
+	// dropped is how many bytes of this frame were discarded for exceeding
+	// maxSSEFrameBytes. Non-zero means data is incomplete and must never be
+	// forwarded: half an event that still parses as JSON is the worst thing a
+	// webhook relay can deliver.
+	dropped int
+}
+
+// consumeSSE parses a text/event-stream and invokes onFrame for each complete
+// frame. ":" keep-alive comments carry no frame and are ignored here; they
+// still count as liveness one layer down, in liveReader. It returns when the
+// reader is exhausted, errors, or the context is cancelled.
 //
 // Repeated `data:` lines within one frame are joined with newlines, which is
 // what the SSE spec says they mean. BillKit's stream encodes each event with
@@ -643,43 +650,145 @@ func (g *apiGapFiller) page(ctx context.Context, limit int, cursor string) ([][]
 // appending would turn any future multi-line payload into a truncated
 // fragment that still parses as JSON often enough to be forwarded — the worst
 // available failure mode for a webhook relay.
-func consumeSSE(ctx context.Context, r io.Reader, onFrame func(context.Context, string, []byte)) error {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20) // up to 1 MiB per event
-	var eventName string
-	var data []string
-	for scanner.Scan() {
+//
+// An oversized frame is reported through onFrame with `dropped` set, not
+// turned into a stream error. This used to be a bufio.Scanner, which fails
+// the whole connection on a token longer than its buffer: combined with the
+// resume cursor, the server would replay the same oversized event on every
+// reconnect and the listener would spin on one row forever. Reading past it
+// and saying so is the only behaviour that both keeps the stream moving and
+// keeps the loss visible.
+func consumeSSE(ctx context.Context, r io.Reader, onFrame func(context.Context, sseFrame)) error {
+	br := bufio.NewReaderSize(r, sseReadBuffer)
+	var (
+		frame sseFrame
+		data  []string
+		size  int
+	)
+	reset := func() {
+		frame, data, size = sseFrame{}, nil, 0
+	}
+	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		line := scanner.Text()
-		switch {
-		case strings.HasPrefix(line, "event:"):
-			eventName = strings.TrimSpace(line[len("event:"):])
-		case strings.HasPrefix(line, "data:"):
-			data = append(data, strings.TrimSpace(line[len("data:"):]))
-		case line == "": // blank line terminates one SSE frame
-			payload := strings.Join(data, "\n")
-			if eventName != "" && payload != "" {
-				onFrame(ctx, eventName, []byte(payload))
+		line, over, err := sseLine(br, maxSSEFrameBytes)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
 			}
-			eventName, data = "", nil
+			return err
+		}
+		frame.dropped += over
+
+		switch {
+		case strings.HasPrefix(line, "id:"):
+			frame.id = strings.TrimSpace(line[len("id:"):])
+		case strings.HasPrefix(line, "event:"):
+			frame.event = strings.TrimSpace(line[len("event:"):])
+		case strings.HasPrefix(line, "data:"):
+			// Already known incomplete (this line overflowed, or an earlier
+			// one did), so there is nothing worth keeping: the frame can only
+			// be reported, never forwarded.
+			if frame.dropped > 0 {
+				break
+			}
+			chunk := strings.TrimSpace(line[len("data:"):])
+			if size+len(chunk) > maxSSEFrameBytes {
+				frame.dropped += len(chunk)
+				break
+			}
+			size += len(chunk)
+			data = append(data, chunk)
+		case line == "": // blank line terminates one SSE frame
+			frame.data = []byte(strings.Join(data, "\n"))
+			// The SSE spec's default: a frame carrying data but no `event:`
+			// line is a "message". BillKit always writes `event: message`
+			// (api/billkit/api/events.py, `_sse`), so this changes nothing
+			// today. It is a contract guard, so an intermediary that strips
+			// the line, or a future frame that omits it, delivers the event
+			// rather than dropping it silently.
+			if frame.event == "" && len(frame.data) > 0 {
+				frame.event = "message"
+			}
+			if frame.dropped > 0 || (frame.event != "" && len(frame.data) > 0) {
+				onFrame(ctx, frame)
+			}
+			reset()
 		}
 	}
-	return scanner.Err()
 }
 
-// eventMeta pulls the id and creation time out of one event payload. A
-// payload that does not parse is still forwarded; it just cannot anchor the
-// resume cursor.
-func eventMeta(raw []byte) (string, int64) {
+// sseLine reads one line, keeping at most limit bytes of it and reporting how
+// many it threw away.
+//
+// ReadSlice rather than ReadString or a Scanner, because both of those grow a
+// buffer to fit whatever arrives: a single unterminated multi-gigabyte line
+// would be read entirely into memory before anyone could decide it was too
+// long. ReadSlice hands back what fits in the fixed buffer and says there is
+// more, which is what makes discarding the rest incremental.
+func sseLine(br *bufio.Reader, limit int) (line string, dropped int, err error) {
+	var kept []byte
+	for {
+		chunk, e := br.ReadSlice('\n')
+		if room := limit - len(kept); room > 0 {
+			n := min(len(chunk), room)
+			// Copied immediately: ReadSlice returns a view into the reader's
+			// own buffer, which the next read overwrites.
+			kept = append(kept, chunk[:n]...)
+			dropped += len(chunk) - n
+		} else {
+			dropped += len(chunk)
+		}
+		switch {
+		case e == nil:
+			return strings.TrimRight(string(kept), "\r\n"), dropped, nil
+		case errors.Is(e, bufio.ErrBufferFull):
+			continue
+		case errors.Is(e, io.EOF) && (len(kept) > 0 || dropped > 0):
+			// A final line the server never terminated. It is still a line.
+			return strings.TrimRight(string(kept), "\r\n"), dropped, nil
+		default:
+			return "", dropped, e
+		}
+	}
+}
+
+// eventID pulls the id out of one event payload. A payload that does not
+// parse is still forwarded; it just cannot advance the resume cursor.
+func eventID(raw []byte) string {
 	var meta struct {
-		ID      string `json:"id"`
-		Created int64  `json:"created"`
+		ID string `json:"id"`
 	}
 	_ = json.Unmarshal(raw, &meta)
-	return meta.ID, meta.Created
+	return meta.ID
 }
+
+// validateForwardURL rejects a --forward-to that http.NewRequest would refuse
+// on every event, so the mistake is reported once, at start-up, instead of
+// once per delivery. An empty value is fine: it means "log, do not forward".
+func validateForwardURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid --forward-to %q: %w", raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("invalid --forward-to %q: expected an http:// or https:// URL", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("invalid --forward-to %q: no host", raw)
+	}
+	return nil
+}
+
+// forwardBackoff is the pause before each retry of a failed local delivery.
+// Its length is also the attempt budget: three attempts in total, spread over
+// a little under four seconds, which covers the restart of a dev server
+// without holding the stream up long enough to matter.
+var forwardBackoff = []time.Duration{250 * time.Millisecond, time.Second, 2 * time.Second}
 
 // forwarder logs and (optionally) re-signs + POSTs each event to a local URL.
 type forwarder struct {
@@ -692,8 +801,26 @@ type forwarder struct {
 	// move to stderr under --print-json so stdout stays pipeable.
 	out    io.Writer
 	logOut io.Writer
+	// backoff overrides forwardBackoff. A field so the tests can drive the
+	// real retry path in microseconds; nil everywhere else.
+	backoff []time.Duration
 }
 
+// handle forwards one event, retrying a delivery that never reached the local
+// app at all.
+//
+// Only a connection error or a timeout is retried, never an HTTP response of
+// any status. A 500 from the developer's handler is that handler's answer to
+// this event: a real webhook endpoint would get a redelivery, but a real
+// endpoint also gets an idempotent handler written against one, and quietly
+// re-posting the same body into a local app that answered would manufacture
+// duplicates the production dispatcher's own schedule would not.
+//
+// A refused connection is different. `deliver` advances the resume cursor
+// after this returns, so before this loop existed an event that arrived in
+// the second a dev server spends restarting on a file save was logged once
+// and then gone for good: the listener still looked healthy, and the event
+// was never coming back.
 func (f *forwarder) handle(ctx context.Context, raw []byte) {
 	var meta struct {
 		ID   string `json:"id"`
@@ -709,21 +836,69 @@ func (f *forwarder) handle(ctx context.Context, raw []byte) {
 		return
 	}
 
+	backoff := f.backoff
+	if backoff == nil {
+		backoff = forwardBackoff
+	}
+	var lastErr error
+	for attempt := 1; attempt <= len(backoff)+1; attempt++ {
+		status, err := f.post(ctx, raw, meta.Type, meta.ID, attempt)
+		if err == nil {
+			fmt.Fprintf(f.logOut, "  %s  %s  -> %d\n", meta.Type, meta.ID, status)
+			return
+		}
+		lastErr = err
+		if attempt > len(backoff) {
+			break
+		}
+		fmt.Fprintf(f.logOut, "  %s  %s  -> %v (retrying in %s)\n", meta.Type, meta.ID, err, backoff[attempt-1])
+		// Inside the attempt context, so Ctrl-C still stops promptly rather
+		// than waiting out the longest step.
+		if !api.SleepFor(ctx, backoff[attempt-1]) {
+			return
+		}
+	}
+	fmt.Fprintf(f.logOut, "  %s  %s  -> NOT forwarded after %d attempts: %v\n",
+		meta.Type, meta.ID, len(backoff)+1, lastErr)
+	if meta.ID != "" {
+		fmt.Fprintf(f.logOut, "!   Read it with: billkit events retrieve %s\n", meta.ID)
+	}
+}
+
+// post makes one delivery attempt. It returns the response status, or an
+// error when the request never got one.
+//
+// The header set matches what the real dispatcher sends
+// (api/billkit/services/webhook_dispatcher.py), because the whole point of
+// `listen` is that code written against it works unchanged in production. It
+// used to omit BillKit-Event-Id, so a handler that deduped on that header
+// read an empty string locally, passed every local test, and deduped nothing
+// once deployed.
+//
+// Two of them differ deliberately. The User-Agent carries both identities, so
+// a log can still tell a relayed event from a real delivery. And
+// BillKit-Delivery-Attempt counts this loop's attempts rather than always
+// saying 1: a retried forward really is a second attempt at the same event,
+// which is exactly what the header means on the wire.
+func (f *forwarder) post(ctx context.Context, raw []byte, eventType, eventID string, attempt int) (int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.url, bytes.NewReader(raw))
 	if err != nil {
-		fmt.Fprintf(f.logOut, "  %s  %s  -> build error: %v\n", meta.Type, meta.ID, err)
-		return
+		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "billkit-cli/"+Version)
-	req.Header.Set("BillKit-Event-Type", meta.Type)
+	req.Header.Set("User-Agent", "BillKit-Webhook/1.0 billkit-cli/"+Version)
 	req.Header.Set("BillKit-Signature", sign.Header(f.secret, time.Now().Unix(), raw))
+	req.Header.Set("BillKit-Event-Id", eventID)
+	req.Header.Set("BillKit-Event-Type", eventType)
+	req.Header.Set("BillKit-Delivery-Attempt", strconv.Itoa(attempt))
 
 	resp, err := f.client.Do(req)
 	if err != nil {
-		fmt.Fprintf(f.logOut, "  %s  %s  -> error: %v\n", meta.Type, meta.ID, err)
-		return
+		return 0, err
 	}
+	// Drain before closing, or net/http cannot reuse the connection and a
+	// busy stream opens a fresh socket to the local app per event.
+	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
-	fmt.Fprintf(f.logOut, "  %s  %s  -> %d\n", meta.Type, meta.ID, resp.StatusCode)
+	return resp.StatusCode, nil
 }

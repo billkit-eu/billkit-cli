@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,16 +68,41 @@ func runMutating(cmd *cobra.Command, g *globals, call mutatingCall) ([]byte, err
 	defer cancel()
 	out, err := c.Do(ctx, call.method, call.path, call.body, api.WithIdempotencyKey(key))
 	if err != nil {
-		var apiErr *api.APIError
-		if !errors.As(err, &apiErr) {
-			// No HTTP status ever came back, and the client already retried
-			// with this key. The server may still have done the work, so say
-			// so instead of letting the user guess.
+		if ambiguousOutcome(err) {
 			warnAmbiguous(errw, call, key)
 		}
 		return nil, err
 	}
 	return out, nil
+}
+
+// ambiguousOutcome reports whether this failure leaves it genuinely unknown
+// whether the server did the work. Those are the only ones worth the
+// "may already exist, here is the safe re-run" guidance; printing it after a
+// 422 would teach people to ignore it.
+//
+// Three cases qualify, and the client has already retried each of them with
+// this same key:
+//
+//   - No HTTP status at all. The request may have been received and answered
+//     into a connection that died.
+//   - 409 idempotency_in_progress after the retries ran out. This one says
+//     outright that a request with this key is still executing server-side.
+//   - Any 5xx. A 502 or 504 from a proxy is a statement about the hop, not
+//     about whether the API finished; even a 500 can land after the write
+//     committed and the response failed to render.
+//
+// Everything else is the server saying the request itself was wrong, which
+// means nothing happened.
+func ambiguousOutcome(err error) bool {
+	var apiErr *api.APIError
+	if !errors.As(err, &apiErr) {
+		return true
+	}
+	if apiErr.StatusCode >= 500 {
+		return true
+	}
+	return apiErr.StatusCode == http.StatusConflict && apiErr.Code == api.CodeIdempotencyInProgress
 }
 
 // announceMode states which credentials are about to be used. In live mode on
@@ -167,7 +193,7 @@ func interactive(cmd *cobra.Command) bool {
 // the request may well have succeeded on the server, so say what to check and
 // give the exact command that retries without spending twice.
 func warnAmbiguous(w io.Writer, call mutatingCall, key string) {
-	fmt.Fprintf(w, "\n! No response came back, so the server may already have processed this.\n")
+	fmt.Fprintf(w, "\n! The outcome is unknown, so the server may already have processed this.\n")
 	fmt.Fprintf(w, "!   The %s may already exist.\n", call.what)
 	if call.checkCmd != "" {
 		fmt.Fprintf(w, "!   Check first:  %s\n", call.checkCmd)
@@ -177,11 +203,19 @@ func warnAmbiguous(w io.Writer, call mutatingCall, key string) {
 
 // retryCommand renders the command the user just ran, carrying the
 // idempotency key, so a retry is deduplicated rather than charged again.
+//
+// The one thing it will not render is the key behind --api-key. This line is
+// printed to stderr, which is precisely where a CI job's log, a bug report
+// and a pasted terminal transcript come from, and nothing else in this CLI
+// ever prints the secret: creds.origin() names the source and the live-mode
+// banner shows that name. Reproducing argv verbatim would have made the
+// "something went wrong, here is how to retry" path the only one that leaks
+// it — the worst possible moment, because it is the line the user copies.
 func retryCommand(key string) string {
 	args := make([]string, 0, len(os.Args)+2)
 	if len(os.Args) > 0 {
 		args = append(args, filepath.Base(os.Args[0]))
-		args = append(args, os.Args[1:]...)
+		args = append(args, redactAPIKey(os.Args[1:])...)
 	} else {
 		args = append(args, "billkit")
 	}
@@ -193,6 +227,30 @@ func retryCommand(key string) string {
 		quoted[i] = shellQuote(a)
 	}
 	return strings.Join(quoted, " ")
+}
+
+// redactAPIKey replaces the value of --api-key, in either the `--flag value`
+// or the `--flag=value` spelling, with a placeholder. The result is still a
+// runnable command once the user substitutes their key back in, which is the
+// most a redacted command line can honestly offer.
+func redactAPIKey(args []string) []string {
+	const placeholder = "<your-api-key>"
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--api-key":
+			out = append(out, args[i])
+			if i+1 < len(args) {
+				out = append(out, placeholder)
+				i++
+			}
+		case strings.HasPrefix(args[i], "--api-key="):
+			out = append(out, "--api-key="+placeholder)
+		default:
+			out = append(out, args[i])
+		}
+	}
+	return out
 }
 
 // hasIdempotencyArg reports whether the command line already carries the key,

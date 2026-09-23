@@ -7,9 +7,11 @@
 # sdk/scripts/split-templates/cli/) is what invokes this file on a `v*` tag.
 #
 # Before a tag, validate with `goreleaser check` and a `goreleaser release
-# --snapshot --clean`. Be aware that a snapshot does NOT exercise the publish
-# pipe, so it cannot catch a bad `homebrew_casks.repository.token`; see the note
-# on that field.
+# --snapshot --clean --skip=sign`. `--skip=sign` is needed because the `signs:`
+# block below is keyless and needs a GitHub OIDC token, which a laptop does not
+# have; everything else runs. Be aware that a snapshot does NOT exercise the
+# publish pipe, so it cannot catch a bad `homebrew_casks.repository.token`; see
+# the note on that field.
 #
 # The macOS signing and notarization credentials are documented on the
 # `notarize:` block below, and mirrored in cli/README.md under "Signing and
@@ -120,6 +122,51 @@ archives:
 checksum:
   name_template: checksums.txt
 
+# Provenance for checksums.txt, and through it for every archive beside it.
+#
+# `install.sh` already verifies integrity: it reads checksums.txt and refuses an
+# archive that does not match. That catches a truncated download, a corrupted
+# mirror and a mangling proxy, and it catches nothing else — checksums.txt comes
+# down the same channel as the archive, so anyone able to rewrite one can
+# rewrite both. This block closes that gap: a signature over checksums.txt that
+# only this repository's release workflow could have produced, which is what
+# turns "these bytes are intact" into "these bytes are ours".
+#
+# Keyless, via Sigstore. There is no private key to store, rotate or leak: the
+# job's GitHub OIDC token is exchanged for a certificate valid for minutes
+# (hence `id-token: write` in publish.yml), the signature is recorded in the
+# public Rekor transparency log, and a verifier checks the certificate's
+# *identity* — repo, workflow file and tag — rather than a public key we would
+# otherwise have to publish and defend. Signing the checksum file rather than
+# each archive is deliberate and standard: the checksums already cover the
+# archives, so one signature covers the release.
+#
+# Unlike the Homebrew tap token and the macOS signing credentials, this does NOT
+# skip itself when something is missing, and the difference is not an
+# inconsistency. Those two depend on secrets a human has to set in repository
+# settings, where "forgotten" is a normal state and failing a release over it
+# helps nobody. This depends only on a permission declared in the workflow file
+# next to it, so "it did not run" can only mean that file is wrong — and the
+# artifact of that mistake is a release whose provenance install.sh silently
+# cannot check. That one should fail loudly and be fixed.
+signs:
+  - id: checksums
+    cmd: cosign
+    artifacts: checksum
+    signature: "${artifact}.sig"
+    certificate: "${artifact}.pem"
+    # Surface cosign's own output in the job log; a signing step that says
+    # nothing is one nobody notices has stopped working.
+    output: true
+    args:
+      - sign-blob
+      - "--output-signature=${signature}"
+      - "--output-certificate=${certificate}"
+      - "${artifact}"
+      # cosign prompts for confirmation before writing to the public
+      # transparency log, and there is nobody here to answer it.
+      - "--yes"
+
 # A cask rather than a formula. Homebrew asks that pre-built binaries ship as
 # casks, and GoReleaser has deprecated `brews` accordingly: with `brews` here,
 # `goreleaser check` exits non-zero on the deprecation alone, which is a poor
@@ -177,3 +224,10 @@ release:
   github:
     owner: billkit-eu
     name: billkit-cli
+  # Make a re-run idempotent. GoReleaser reuses an existing release for the tag
+  # (createOrUpdateRelease), but by default a second upload of an asset that is
+  # already there is a hard 422 `already_exists`, so re-running a job that failed
+  # *after* the upload step — which is exactly where the Homebrew cask push sits —
+  # cannot get past the uploads to reach the step that failed. That happened on
+  # v0.2.4 and had to be unpicked by deleting the seven assets by hand.
+  replace_existing_artifacts: true

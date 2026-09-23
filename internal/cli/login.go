@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/billkit-eu/billkit-cli/internal/api"
@@ -12,13 +13,42 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// loginProfileName decides which profile this key is stored under: --profile,
+// else BILLKIT_PROFILE, else the mode the key's prefix names.
+//
+// Every other command already resolves an arbitrary profile name, and `config
+// use` and `logout` already operate on one, so login was the only place that
+// pretended the set was fixed at {test, live}: `--profile staging` was
+// accepted on the command line, silently ignored, and the key landed under
+// "test" — which the next `--profile staging` then could not find.
+//
+// The one name it refuses is the other mode's. "test" and "live" are the names
+// the CLI assigns from the key prefix, and they are what `config list`,
+// `logout` and the live-mode banner report back; a live key stored under
+// "test" makes every one of those read as a reassurance that is false. Any
+// other name is the user's to choose.
+func loginProfileName(g *globals, mode string) (string, error) {
+	name := strings.TrimSpace(profileOverride(g))
+	if name == "" {
+		return mode, nil
+	}
+	if other := map[string]string{"test": "live", "live": "test"}[name]; other == mode {
+		return "", fmt.Errorf(
+			"refusing to store a %s key under the profile name %q: that name is reserved for %s keys, "+
+				"and `billkit config list` would report this one as %s. Pick another name, or omit --profile to use %q",
+			mode, name, name, name, mode)
+	}
+	return name, nil
+}
+
 func loginCmd(g *globals) *cobra.Command {
 	return &cobra.Command{
 		Use:   "login",
 		Short: "Store an API key for a profile",
 		Long: "Store a BillKit API key (bk_test_… / bk_live_…) in ~/.billkit/config.json.\n" +
-			"The key's prefix selects the profile (test/live) and the key is validated\n" +
-			"against the API before being saved.\n\n" +
+			"The key's prefix names the profile (test/live) unless --profile says\n" +
+			"otherwise, and the key is validated against the API before being saved.\n\n" +
+			"  billkit login --profile staging   # store under a name of your choosing\n\n" +
 			"The prompt does not echo what you type. To skip it non-interactively,\n" +
 			"set BILLKIT_API_KEY or pipe the key in (`cat key.txt | billkit login`).\n" +
 			"--api-key works too but puts the secret in the process list and in your\n" +
@@ -42,6 +72,13 @@ func loginCmd(g *globals) *cobra.Command {
 			mode := config.Mode(key)
 			if mode == "" {
 				return fmt.Errorf("that doesn't look like a BillKit key (expected bk_test_… or bk_live_…)")
+			}
+			// Before the key reaches the wire. A name this command is going to
+			// refuse should not cost a round trip first, and "your key is
+			// fine, but" is a confusing way to report a flag error.
+			name, err := loginProfileName(g, mode)
+			if err != nil {
+				return err
 			}
 
 			baseURL := baseURLOverride(g)
@@ -89,18 +126,18 @@ func loginCmd(g *globals) *cobra.Command {
 			if baseURL != config.DefaultBaseURL {
 				p.BaseURL = baseURL
 			}
-			cfg.Set(mode, p)
+			cfg.Set(name, p)
 			// The profile you just authenticated is the one you meant to use.
 			// Without this, logging in with a test key while a live key was
 			// already stored leaves every later command on the live key --
 			// the CLI says "test mode" and then spends real money.
-			cfg.SetDefault(mode)
+			cfg.SetDefault(name)
 			if err := cfg.Save(); err != nil {
 				return err
 			}
 
 			path, _ := config.Path()
-			fmt.Printf("✓ Logged in (%s mode). Profile %q is now the default. Credentials saved to %s\n", mode, mode, path)
+			fmt.Fprintf(cmd.OutOrStdout(), "✓ Logged in (%s mode). Profile %q is now the default. Credentials saved to %s\n", mode, name, path)
 			return nil
 		},
 	}

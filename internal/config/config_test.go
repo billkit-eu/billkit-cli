@@ -172,7 +172,110 @@ func TestDelete(t *testing.T) {
 // container image at 0644 kept 0644 and quietly took delivery of a bk_live_
 // key. The old Save() passes every other test in this file, because they all
 // start from an empty t.TempDir().
-func TestSaveTightensPreexistingFileAndDir(t *testing.T) {
+// TestSaveTightensTheDefaultConfigDir covers the directory the CLI owns.
+// ~/.billkit is ours and nothing else lives in it, so a pre-existing 0755 one
+// is still tightened on save, because MkdirAll only applies its mode to directories
+// it actually creates, so without this a config dir that arrived from a
+// dotfiles checkout would stay world-listable forever.
+func TestSaveTightensTheDefaultConfigDir(t *testing.T) {
+	skipWithoutPOSIXModes(t)
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	// Unset, not redirected: this is the branch where Path() derives
+	// ~/.billkit itself.
+	t.Setenv("BILLKIT_CONFIG_HOME", "")
+	dir := filepath.Join(home, ".billkit")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	warnings := captureWarnings(t)
+
+	cfg := &Config{Profiles: map[string]Profile{}}
+	cfg.Set("test", Profile{APIKey: "bk_test_SECRET"})
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Errorf("~/.billkit perms = %04o, want 0700: this directory is the CLI's own", perm)
+	}
+	if warnings.Len() != 0 {
+		t.Errorf("the CLI fixed this one itself, so there is nothing to warn about: %q", warnings.String())
+	}
+}
+
+// TestSaveLeavesACustomConfigDirAlone is the other half, and the bug.
+// BILLKIT_CONFIG_HOME can point at a repo checkout, at $HOME itself, or at a
+// shared CI workspace, and Save() used to chmod 0700 over whatever it found
+// there on every single write, re-moding a directory full of somebody else's
+// files. The secret is in the file, which stays 0600 either way.
+func TestSaveLeavesACustomConfigDirAlone(t *testing.T) {
+	skipWithoutPOSIXModes(t)
+
+	dir := filepath.Join(t.TempDir(), "shared-workspace")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BILLKIT_CONFIG_HOME", dir)
+	warnings := captureWarnings(t)
+
+	cfg := &Config{Profiles: map[string]Profile{}}
+	cfg.Set("test", Profile{APIKey: "bk_test_SECRET"})
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o755 {
+		t.Errorf("a directory the user named was re-moded to %04o; the CLI does not own it", perm)
+	}
+	assertOwnerOnlyPerm(t, filepath.Join(dir, "config.json"), 0o600)
+	if !strings.Contains(warnings.String(), "chmod 700") {
+		t.Errorf("a loose custom config dir must be reported, not silently accepted: %q", warnings.String())
+	}
+}
+
+// A custom directory the CLI creates itself needs no chmod and no warning:
+// MkdirAll applies 0700 on creation, and a umask can only narrow it.
+func TestSaveCreatesACustomConfigDirPrivate(t *testing.T) {
+	skipWithoutPOSIXModes(t)
+
+	dir := filepath.Join(t.TempDir(), "fresh")
+	t.Setenv("BILLKIT_CONFIG_HOME", dir)
+	warnings := captureWarnings(t)
+
+	cfg := &Config{Profiles: map[string]Profile{}}
+	cfg.Set("test", Profile{APIKey: "bk_test_SECRET"})
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		t.Errorf("a directory the CLI created is mode %04o, want owner-only", perm)
+	}
+	if warnings.Len() != 0 {
+		t.Errorf("nothing to warn about on a directory we just created: %q", warnings.String())
+	}
+}
+
+func TestSaveTightensPreexistingFile(t *testing.T) {
 	skipWithoutPOSIXModes(t)
 
 	dir := filepath.Join(t.TempDir(), "billkit")
@@ -209,13 +312,8 @@ func TestSaveTightensPreexistingFileAndDir(t *testing.T) {
 	if perm := fileInfo.Mode().Perm(); perm != 0o600 {
 		t.Errorf("config perms = %04o, want 0600 — a live key is readable by every other account on this machine", perm)
 	}
-	dirInfo, err := os.Stat(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if perm := dirInfo.Mode().Perm(); perm != 0o700 {
-		t.Errorf("config dir perms = %04o, want 0700", perm)
-	}
+	// The directory is not touched here: it came from BILLKIT_CONFIG_HOME, so
+	// it is the user's. See TestSaveLeavesACustomConfigDirAlone.
 
 	// The atomic write must not leave its scratch file behind.
 	entries, err := os.ReadDir(dir)

@@ -17,8 +17,22 @@ import (
 // step with the API: a method the server accepts but this slice omits is one
 // the CLI refuses on the client side, with an error that blames the user for
 // a value that is in fact valid. applepay was added in the 2026-09 wallet
-// work and is here for exactly that reason.
-var oneShotMethods = []string{"creditcard", "directdebit", "ideal", "bancontact", "eps", "applepay"}
+// work and is here for exactly that reason; banktransfer had been missing
+// since the enum gained it, which is what
+// api/tests/test_cli_one_shot_methods.py now makes impossible in either
+// direction, the way test_cli_event_constants.py does for event types.
+var oneShotMethods = []string{
+	"creditcard",
+	"directdebit",
+	"ideal",
+	"bancontact",
+	"eps",
+	"applepay",
+	"paypal",
+	// One-off only, and the only method here that settles in days rather
+	// than seconds.
+	"banktransfer",
+}
 
 func checkoutCmd(g *globals) *cobra.Command {
 	cmd := &cobra.Command{
@@ -39,6 +53,7 @@ func checkoutOneShotCmd(g *globals) *cobra.Command {
 		cancelURL        string
 		description      string
 		refundWindowDays int
+		taxBehavior      string
 		metadata         []string
 		idemKey          string
 	)
@@ -66,6 +81,7 @@ func checkoutOneShotCmd(g *globals) *cobra.Command {
 				description:      description,
 				refundWindowDays: refundWindowDays,
 				refundWindowSet:  cmd.Flags().Changed("refund-window-days"),
+				taxBehavior:      taxBehavior,
 				metadata:         meta,
 			})
 			if err != nil {
@@ -95,6 +111,11 @@ func checkoutOneShotCmd(g *globals) *cobra.Command {
 	cmd.Flags().StringVar(&cancelURL, "cancel-url", "", "URL to redirect to if the customer cancels")
 	cmd.Flags().StringVar(&description, "description", "", "statement/description shown to the customer")
 	cmd.Flags().IntVar(&refundWindowDays, "refund-window-days", 0, "days the charge stays refundable (0 disables refunds)")
+	// A one-shot has no Price to carry the intent, so this is the one surface
+	// with a per-request flag. Omitted means "inherit the country default",
+	// which is not the same as either value, so it is a tri-state string and
+	// not a bool.
+	cmd.Flags().StringVar(&taxBehavior, "tax-behavior", "", "whether --amount is quoted gross (inclusive) or net (exclusive); default: the tenant's country default")
 	cmd.Flags().StringArrayVar(&metadata, "metadata", nil, "metadata as key=value (repeatable)")
 	cmd.Flags().StringVar(&idemKey, "idempotency-key", "", "Idempotency-Key for safe retries")
 	_ = cmd.MarkFlagRequired("customer")
@@ -103,6 +124,9 @@ func checkoutOneShotCmd(g *globals) *cobra.Command {
 	_ = cmd.MarkFlagRequired("success-url")
 	_ = cmd.RegisterFlagCompletionFunc("method", func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
 		return oneShotMethods, cobra.ShellCompDirectiveNoFileComp
+	})
+	_ = cmd.RegisterFlagCompletionFunc("tax-behavior", func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
+		return taxBehaviors, cobra.ShellCompDirectiveNoFileComp
 	})
 	return cmd
 }
@@ -117,8 +141,15 @@ type oneShotParams struct {
 	description      string
 	refundWindowDays int
 	refundWindowSet  bool
+	taxBehavior      string
 	metadata         map[string]string
 }
+
+// taxBehaviors mirrors the API's `tax_behavior` literal on
+// OneShotPaymentCreate. "inclusive" backs VAT out of the amount sent;
+// "exclusive" adds it on top, so the payer is charged more than the number on
+// the command line and the response's amount_cents says so.
+var taxBehaviors = []string{"inclusive", "exclusive"}
 
 func buildOneShotBody(p oneShotParams) (map[string]any, error) {
 	if p.amount <= 0 {
@@ -142,6 +173,12 @@ func buildOneShotBody(p oneShotParams) (map[string]any, error) {
 	}
 	if p.refundWindowSet {
 		body["refund_window_days"] = p.refundWindowDays
+	}
+	if p.taxBehavior != "" {
+		if !slices.Contains(taxBehaviors, p.taxBehavior) {
+			return nil, fmt.Errorf("--tax-behavior %q is not one of %s", p.taxBehavior, strings.Join(taxBehaviors, ", "))
+		}
+		body["tax_behavior"] = p.taxBehavior
 	}
 	if len(p.metadata) > 0 {
 		body["metadata"] = p.metadata

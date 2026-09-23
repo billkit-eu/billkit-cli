@@ -8,6 +8,7 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -136,9 +137,20 @@ const (
 	retryMaxDelay = 20 * time.Second
 )
 
-// safeMethod reports whether the HTTP method is safe to replay on its own,
+// CodeIdempotencyInProgress is the one 409 worth retrying. The API raises it
+// (billkit/core/errors.py, ErrorCode.IDEMPOTENCY_IN_PROGRESS) when a request
+// carrying the same Idempotency-Key is still executing, so the work may
+// already be happening and a fresh key is exactly the wrong reaction.
+const CodeIdempotencyInProgress = "idempotency_in_progress"
+
+// SafeMethod reports whether the HTTP method is safe to replay on its own,
 // without an idempotency key.
-func safeMethod(method string) bool {
+//
+// Exported so the `billkit api` escape hatch can route on the same answer the
+// client does. It used to keep its own GET/HEAD list, which put OPTIONS
+// through the mutating path: an idempotency key, a live-mode banner and a
+// confirmation prompt on a request the client already classified as a read.
+func SafeMethod(method string) bool {
 	switch strings.ToUpper(method) {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:
 		return true
@@ -155,10 +167,11 @@ func safeMethod(method string) bool {
 // create is deduplicated by the API instead of charged twice, so a dropped
 // connection stops being an unanswerable "did that refund happen?".
 //
-// Retries cover connection errors, timeouts, 429 and 5xx, at most twice,
-// with exponential backoff plus full jitter and honouring Retry-After. A 4xx
-// other than 429 is never retried, and neither is a request that somehow
-// went out without a key.
+// Retries cover connection errors, timeouts, 429, 5xx and the one 409 that
+// means "your own earlier attempt is still running" (idempotency_in_progress),
+// at most twice, with exponential backoff plus full jitter and honouring
+// Retry-After. Every other 4xx is never retried, and neither is a request that
+// somehow went out without a key.
 func (c *Client) Do(ctx context.Context, method, path string, body any, opts ...RequestOption) ([]byte, error) {
 	var encoded []byte
 	if body != nil {
@@ -172,7 +185,7 @@ func (c *Client) Do(ctx context.Context, method, path string, body any, opts ...
 	// One key for the whole call, minted once: a retry that minted a fresh
 	// key would be exactly the double-spend it is meant to prevent.
 	autoKey := ""
-	if !safeMethod(method) {
+	if !SafeMethod(method) {
 		var err error
 		if autoKey, err = NewIdempotencyKey(); err != nil {
 			return nil, err
@@ -184,7 +197,7 @@ func (c *Client) Do(ctx context.Context, method, path string, body any, opts ...
 		if err != nil {
 			return nil, err
 		}
-		replayable := safeMethod(method) || req.Header.Get("Idempotency-Key") != ""
+		replayable := SafeMethod(method) || req.Header.Get("Idempotency-Key") != ""
 
 		data, status, retryAfter, err := c.roundTrip(req)
 		if err == nil && (status < 200 || status >= 300) {
@@ -193,7 +206,7 @@ func (c *Client) Do(ctx context.Context, method, path string, body any, opts ...
 		if err == nil {
 			return data, nil
 		}
-		if attempt >= maxRetries || !replayable || !retryableFailure(status) || ctx.Err() != nil {
+		if attempt >= maxRetries || !replayable || !retryableFailure(status, err) || ctx.Err() != nil {
 			return nil, err
 		}
 		if !sleepBackoff(ctx, attempt, retryAfter) {
@@ -241,17 +254,39 @@ func (c *Client) roundTrip(req *http.Request) (data []byte, status int, retryAft
 
 	data, err = io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, resp.StatusCode, 0, err
+		// Status 0, not resp.StatusCode. A body that died half way through is
+		// a transport failure: we have the header line and nothing else, so
+		// the request did not complete. Reporting the real status here made
+		// retryableFailure see a 200 and refuse to retry a connection that
+		// never delivered an answer, which is the exact case the retry exists for.
+		return nil, 0, 0, err
 	}
 	return data, resp.StatusCode, ParseRetryAfter(resp.Header.Get("Retry-After")), nil
 }
 
 // retryableFailure reports whether a failed attempt is worth repeating.
 // status 0 means the request never got an answer (connection refused, reset,
-// TLS failure, timeout), which is precisely the ambiguous case retry exists
-// for now that the request carries a key.
-func retryableFailure(status int) bool {
-	return status == 0 || status == http.StatusTooManyRequests || status >= 500
+// TLS failure, timeout, a body that stopped mid-read), which is precisely the
+// ambiguous case retry exists for now that the request carries a key.
+//
+// The one 4xx it lets through is 409 idempotency_in_progress, gated on the
+// envelope's code rather than on the status: it means a request with this
+// same key is still executing server-side, so the work may already be under
+// way and the caller's instinctive workaround, a fresh key, is what turns
+// one charge into two. Because the key on the wire is unchanged, the retry
+// either loses the race again or replays the first call's recorded response.
+// This is the shared SDK contract (sdk/AGENTS.md, "Retry budget"), and the
+// CLI is the client most likely to need it: a write that times out at 80s is
+// retried immediately with the same key. Every other 409 still fails fast.
+func retryableFailure(status int, err error) bool {
+	if status == 0 || status == http.StatusTooManyRequests || status >= 500 {
+		return true
+	}
+	if status != http.StatusConflict {
+		return false
+	}
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.Code == CodeIdempotencyInProgress
 }
 
 // ParseRetryAfter reads the header in either of its legal forms, seconds or
@@ -302,8 +337,12 @@ func Backoff(attempt int, retryAfter time.Duration) time.Duration {
 	if retryAfter > 0 {
 		return min(retryAfter, retryMaxDelay)
 	}
-	// Not security-sensitive, so math/rand is fine.
-	return time.Duration(rand.Int64N(int64(BackoffCeiling(attempt))))
+	// G404: not security-sensitive. This is retry jitter, whose only job is
+	// to stop a fleet of CLIs arriving in lockstep after an outage; an
+	// attacker who can predict it learns when a retry lands and nothing else.
+	// The values that do have to be unguessable, idempotency keys and webhook
+	// secrets, use crypto/rand.
+	return time.Duration(rand.Int64N(int64(BackoffCeiling(attempt)))) //nolint:gosec
 }
 
 // sleepBackoff waits before the next attempt and reports whether the wait

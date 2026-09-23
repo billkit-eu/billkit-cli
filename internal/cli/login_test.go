@@ -99,3 +99,86 @@ func TestLoginStillRefusesABadKey(t *testing.T) {
 		t.Error("login stored a profile for a key the server rejected")
 	}
 }
+
+// TestLoginHonoursTheProfileFlag: --profile was accepted on the command line
+// and silently ignored, so `billkit login --profile staging` stored the key
+// under "test" and the next `--profile staging` could not find it.
+func TestLoginHonoursTheProfileFlag(t *testing.T) {
+	t.Setenv("BILLKIT_CONFIG_HOME", t.TempDir())
+	rec := &recorder{}
+	srv := tlsStub(t, rec.handler())
+
+	if _, err := runCLI(t, "login", "--profile", "staging",
+		"--api-key", "bk_test_STAGING1", "--base-url", srv.URL); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cfg.Profiles["staging"]; !ok {
+		t.Fatalf("the key was not stored under the name that was asked for: %v", cfg.Profiles)
+	}
+	if _, ok := cfg.Profiles["test"]; ok {
+		t.Fatalf("the key must not also land under the mode name: %v", cfg.Profiles)
+	}
+	if cfg.DefaultProfile != "staging" {
+		t.Fatalf("DefaultProfile = %q, want staging", cfg.DefaultProfile)
+	}
+
+	// And the whole point: later commands can select it back.
+	if _, err := runCLI(t, "--profile", "staging", "refunds", "create",
+		"--payment", "pay_1", "--amount", "5"); err != nil {
+		t.Fatal(err)
+	}
+	m := rec.mutations()
+	if len(m) != 1 || m[0].auth != "Bearer bk_test_STAGING1" {
+		t.Fatalf("the named profile did not drive the call: %+v", m)
+	}
+}
+
+// BILLKIT_PROFILE is the same tier, so it has to reach the same place.
+func TestLoginHonoursTheProfileEnvironmentVariable(t *testing.T) {
+	t.Setenv("BILLKIT_CONFIG_HOME", t.TempDir())
+	t.Setenv(envProfile, "ci")
+	srv := tlsStub(t, (&recorder{}).handler())
+
+	if _, err := runCLI(t, "login", "--api-key", "bk_test_CI000001", "--base-url", srv.URL); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cfg.Profiles["ci"]; !ok {
+		t.Fatalf("BILLKIT_PROFILE did not name the stored profile: %v", cfg.Profiles)
+	}
+}
+
+// The one name login refuses: a live key under the name the CLI reserves for
+// test keys would make `config list`, `logout` and the live-mode banner all
+// report a reassurance that is false.
+func TestLoginRefusesToMislabelTheMode(t *testing.T) {
+	t.Setenv("BILLKIT_CONFIG_HOME", t.TempDir())
+	srv := tlsStub(t, (&recorder{}).handler())
+
+	_, err := runCLI(t, "login", "--profile", "test",
+		"--api-key", "bk_live_DANGER01", "--base-url", srv.URL)
+	if err == nil {
+		t.Fatal("storing a live key under the name \"test\" must be refused")
+	}
+	if !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("the error must say why: %v", err)
+	}
+	cfg, _ := config.Load()
+	if len(cfg.Profiles) != 0 {
+		t.Fatalf("nothing should have been written: %v", cfg.Profiles)
+	}
+
+	// The matching name is still fine, and so is any name of the user's own.
+	if _, err := runCLI(t, "login", "--profile", "live",
+		"--api-key", "bk_live_DANGER01", "--base-url", srv.URL); err != nil {
+		t.Fatal(err)
+	}
+}

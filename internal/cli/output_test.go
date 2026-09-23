@@ -3,10 +3,13 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
 
 // colorizeJSON must always emit valid JSON, including for edge-case inputs
@@ -155,6 +158,43 @@ func TestCommandJSONGoesToTheCobraWriter(t *testing.T) {
 	// The pre-request notices are stderr's, so stdout stays pipeable.
 	if strings.Contains(out.String(), "Using API host") {
 		t.Fatalf("a human-readable notice leaked onto stdout:\n%s", out.String())
+	}
+}
+
+// TestPlainTextOutputGoesToTheCobraWriter is the other half of the same
+// invariant, and the half that had quietly rotted: `config list`, `config
+// use`, `config path`, `login` and a bare `trigger` all still called
+// fmt.Println, so their output went to os.Stdout no matter where the caller
+// pointed the command. A test could not read them, and an embedding caller
+// could not capture them.
+func TestPlainTextOutputGoesToTheCobraWriter(t *testing.T) {
+	t.Setenv("BILLKIT_CONFIG_HOME", t.TempDir())
+	g := &globals{color: "never"}
+
+	for _, tc := range []struct {
+		name string
+		cmd  func() *cobra.Command
+		args []string
+		want string
+	}{
+		{"config path", func() *cobra.Command { return configCmd(g) }, []string{"path"}, "config.json"},
+		{"config list", func() *cobra.Command { return configCmd(g) }, []string{"list"}, "No profiles configured"},
+		{"trigger", func() *cobra.Command { return triggerCmd(g) }, nil, "customer.created"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := tc.cmd()
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(io.Discard)
+			cmd.SetArgs(tc.args)
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if !strings.Contains(out.String(), tc.want) {
+				t.Fatalf("%s wrote nothing containing %q to the command's own writer, got %q",
+					tc.name, tc.want, out.String())
+			}
+		})
 	}
 }
 

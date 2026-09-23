@@ -1,10 +1,28 @@
 version: "2"
 
-# Default linters (errcheck, govet, ineffassign, staticcheck, unused) plus a
-# couple of high-signal extras.
+# Default linters (errcheck, govet, ineffassign, staticcheck, unused) plus the
+# extras that pay for themselves on a CLI that moves money over HTTP:
+#
+#   errorlint: a comparison against a wrapped error silently stops matching
+#                the day someone adds %w, and this package's control flow is
+#                built on errors.As over *api.APIError.
+#   bodyclose: an unclosed response body leaks a connection per event on a
+#                command designed to run for days.
+#   noctx: a request built without a context cannot be cancelled by
+#                Ctrl-C or by a deadline, which is the whole safety story for
+#                the 80s money writes.
+#   gosec: it stores live API keys on disk and shells nothing out; the
+#                file-permission and weak-randomness rules are exactly the
+#                ones worth having a machine check.
+#   gocritic: the default checks only, for the ordinary slips.
 linters:
   enable:
+    - bodyclose
+    - errorlint
+    - gocritic
+    - gosec
     - misspell
+    - noctx
     - unconvert
   settings:
     errcheck:
@@ -16,3 +34,17 @@ linters:
         - fmt.Fprint
         - fmt.Fprintf
         - fmt.Fprintln
+  exclusions:
+    rules:
+      # gosec off in tests. These tests exist to prove the CLI copes with the
+      # states gosec is warning about: a config dir left at 0755, a config
+      # file at 0644, a symlink planted at config.json. Writing them any other
+      # way would mean not testing the thing.
+      - linters: [gosec]
+        path: _test\.go
+      # G101 flags the *names* of the credential environment variables, which
+      # are not credentials. The key itself is never in the source; env.go is
+      # the file that goes out of its way to keep it out of argv.
+      - linters: [gosec]
+        text: "G101"
+        path: internal/cli/env\.go

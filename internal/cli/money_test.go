@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -21,16 +23,22 @@ type recordedRequest struct {
 	path   string
 	auth   string
 	idem   string
+	// body is what the CLI actually put on the wire, verbatim. Asserting on
+	// the re-encoded bytes rather than on the Go value is the point for
+	// --json, whose whole contract is that it does not re-encode.
+	body string
 }
 
 func (r *recorder) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		raw, _ := io.ReadAll(req.Body)
 		r.mu.Lock()
 		r.requests = append(r.requests, recordedRequest{
 			method: req.Method,
 			path:   req.URL.Path,
 			auth:   req.Header.Get("Authorization"),
 			idem:   req.Header.Get("Idempotency-Key"),
+			body:   string(raw),
 		})
 		r.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
@@ -414,6 +422,45 @@ func TestRetryCommandCarriesTheKey(t *testing.T) {
 	}
 }
 
+// TestRetryCommandNeverEchoesTheAPIKey: warnAmbiguous prints this line to
+// stderr, which is where CI logs, bug reports and pasted transcripts come
+// from. Every other surface in this CLI names the *source* of a key and never
+// the key, so reproducing argv verbatim made the failure path the only leak.
+func TestRetryCommandNeverEchoesTheAPIKey(t *testing.T) {
+	const secret = "bk_live_supersecretvalue"
+	for _, argv := range [][]string{
+		{"billkit", "refunds", "create", "--api-key", secret, "--payment", "pay_1"},
+		{"billkit", "refunds", "create", "--api-key=" + secret, "--payment", "pay_1"},
+	} {
+		t.Run(argv[3], func(t *testing.T) {
+			saved := os.Args
+			os.Args = argv
+			t.Cleanup(func() { os.Args = saved })
+
+			got := retryCommand("cli_abc")
+			if strings.Contains(got, secret) {
+				t.Fatalf("retryCommand leaked the key: %q", got)
+			}
+			if !strings.Contains(got, "--api-key") {
+				t.Errorf("the flag itself must survive so the command stays runnable: %q", got)
+			}
+			if !strings.Contains(got, "--idempotency-key cli_abc") {
+				t.Errorf("retryCommand = %q, want it to carry the key", got)
+			}
+		})
+	}
+}
+
+// A bare --api-key with nothing after it is a user error the shell will report;
+// redaction must not lose the flag or index past the end of argv.
+func TestRedactAPIKeyHandlesATrailingFlag(t *testing.T) {
+	got := redactAPIKey([]string{"refunds", "create", "--api-key"})
+	want := []string{"refunds", "create", "--api-key"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("redactAPIKey = %v, want %v", got, want)
+	}
+}
+
 func TestShellQuote(t *testing.T) {
 	cases := map[string]string{
 		"plain":       "plain",
@@ -427,5 +474,90 @@ func TestShellQuote(t *testing.T) {
 		if got := shellQuote(in); got != want {
 			t.Errorf("shellQuote(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestAmbiguousGuidanceCoversEveryUnknownOutcome. The "may already exist,
+// here is the safe re-run" guidance used to print only when no HTTP status
+// ever came back. Two answers say just as little about whether the server did
+// the work: a 409 idempotency_in_progress that outlived the retries, which
+// states outright that a request with this key is still executing, and any
+// 5xx, since a 502 or 504 from a proxy is a statement about the hop, not about the
+// API. Both left the user with a bare error and no safe way to retry.
+func TestAmbiguousGuidanceCoversEveryUnknownOutcome(t *testing.T) {
+	const marker = "may already exist"
+	cases := []struct {
+		name    string
+		status  int
+		body    string
+		wantAmb bool
+	}{
+		{
+			name:    "409 idempotency_in_progress",
+			status:  http.StatusConflict,
+			body:    `{"error":{"code":"idempotency_in_progress","message":"still running"}}`,
+			wantAmb: true,
+		},
+		{
+			name:    "502 from a proxy",
+			status:  http.StatusBadGateway,
+			body:    `{"error":{"message":"bad gateway"}}`,
+			wantAmb: true,
+		},
+		{
+			// The server saying the request itself was wrong. Nothing
+			// happened, and guidance here teaches people to ignore it.
+			name:    "422 validation",
+			status:  http.StatusUnprocessableEntity,
+			body:    `{"error":{"code":"invalid_request","message":"bad amount"}}`,
+			wantAmb: false,
+		},
+		{
+			name:    "409 idempotency_key_in_use",
+			status:  http.StatusConflict,
+			body:    `{"error":{"code":"idempotency_key_in_use","message":"different body"}}`,
+			wantAmb: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			stderr, err := runCLI(t,
+				"refunds", "create", "--payment", "pay_123", "--amount", "500",
+				"--api-key", "bk_test_x", "--base-url", srv.URL)
+			if err == nil {
+				t.Fatal("expected the call to fail")
+			}
+			if got := strings.Contains(stderr, marker); got != tc.wantAmb {
+				t.Fatalf("ambiguity guidance shown = %v, want %v; stderr = %q", got, tc.wantAmb, stderr)
+			}
+		})
+	}
+}
+
+// The transport case: nothing answered at all. Closing the listener before
+// the call makes every attempt fail to connect.
+func TestAmbiguousGuidanceOnATransportFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := srv.URL
+	srv.Close()
+
+	stderr, err := runCLI(t,
+		"refunds", "create", "--payment", "pay_123", "--amount", "500",
+		"--api-key", "bk_test_x", "--base-url", url)
+	if err == nil {
+		t.Fatal("expected the call to fail")
+	}
+	if !strings.Contains(stderr, "may already exist") {
+		t.Fatalf("a refund with no answer at all must print the safe re-run; stderr = %q", stderr)
+	}
+	if !strings.Contains(stderr, "--idempotency-key") {
+		t.Fatalf("the guidance must carry the key; stderr = %q", stderr)
 	}
 }

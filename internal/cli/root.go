@@ -30,7 +30,7 @@ import (
 // version that disagrees with it, and the mirror's publish workflow re-checks
 // the pushed tag against it before GoReleaser runs. So bump it here, split, then
 // tag. See sdk/RELEASING.md.
-var Version = "0.2.4"
+var Version = "0.3.0"
 
 // globals holds the values behind the root command's persistent flags.
 //
@@ -102,7 +102,61 @@ func rootCmd() *cobra.Command {
 		checkoutCmd(g),
 		apiCmd(g),
 	)
+	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return &UsageError{err} })
+	markUsageErrors(root)
 	return root
+}
+
+// Process exit statuses. A script wrapping this CLI has to be able to tell
+// "I typed the command wrong" from "the command ran and the call failed",
+// because only one of those is worth retrying or paging about.
+const (
+	// ExitFailure is a command that ran and did not succeed.
+	ExitFailure = 1
+	// ExitUsage is a bad invocation: an unknown or malformed flag, or the
+	// wrong number of arguments. It is the conventional 2, the same one
+	// getopt-based tools and `go` itself use.
+	ExitUsage = 2
+)
+
+// UsageError marks an error as a bad invocation rather than a failed call.
+// It is a wrapper rather than a sentinel so the original message, which cobra
+// and pflag word perfectly well, is what the user still reads.
+type UsageError struct{ err error }
+
+func (e *UsageError) Error() string { return e.err.Error() }
+func (e *UsageError) Unwrap() error { return e.err }
+
+// ExitCode maps an error returned by Execute onto a process exit status.
+func ExitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var usage *UsageError
+	if errors.As(err, &usage) {
+		return ExitUsage
+	}
+	return ExitFailure
+}
+
+// markUsageErrors tags the two error paths cobra has for a bad invocation.
+// Flag parsing is one hook for the whole tree (FlagErrorFunc is inherited
+// from the root), and argument validation is per-command, so it is wrapped
+// where a command actually declares a validator. A command that declares none
+// is left alone rather than given cobra's default, because substituting a
+// validator changes which errors it produces.
+func markUsageErrors(c *cobra.Command) {
+	if inner := c.Args; inner != nil {
+		c.Args = func(cmd *cobra.Command, args []string) error {
+			if err := inner(cmd, args); err != nil {
+				return &UsageError{err}
+			}
+			return nil
+		}
+	}
+	for _, sub := range c.Commands() {
+		markUsageErrors(sub)
+	}
 }
 
 // Execute runs the CLI.

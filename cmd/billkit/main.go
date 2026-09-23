@@ -19,6 +19,9 @@ import (
 func main() {
 	if err := cli.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "Error: "+err.Error())
-		os.Exit(1)
+		// 2 for a bad invocation, 1 for a call that ran and failed. Every
+		// error used to exit 1, so a script could not tell a typo'd flag from
+		// a refused refund, and the one it should stop and fix is the typo.
+		os.Exit(cli.ExitCode(err))
 	}
 }

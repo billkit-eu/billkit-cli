@@ -72,9 +72,14 @@ func Mode(apiKey string) string {
 	}
 }
 
+// configHomeEnv relocates the whole config directory. Its presence is also
+// what tells Save() the directory is the user's rather than the CLI's; see
+// ensureConfigDir.
+const configHomeEnv = "BILLKIT_CONFIG_HOME"
+
 // Path returns the config file location, honoring BILLKIT_CONFIG_HOME.
 func Path() (string, error) {
-	if custom := os.Getenv("BILLKIT_CONFIG_HOME"); custom != "" {
+	if custom := os.Getenv(configHomeEnv); custom != "" {
 		return filepath.Join(custom, "config.json"), nil
 	}
 	home, err := os.UserHomeDir()
@@ -90,7 +95,11 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(path)
+	// G304: the path is this package's own, from Path(): the default
+	// ~/.billkit/config.json or the directory the user pointed
+	// BILLKIT_CONFIG_HOME at. Reading the config file is what Load is for,
+	// and there is no caller-supplied path to sanitise.
+	data, err := os.ReadFile(path) //nolint:gosec
 	if errors.Is(err, os.ErrNotExist) {
 		return &Config{Profiles: map[string]Profile{}}, nil
 	}
@@ -116,18 +125,15 @@ func Load() (*Config, error) {
 // existed at 0644, an interrupted login cannot truncate the other profile's
 // key, and a symlink planted at config.json is replaced rather than written
 // through.
+//
+// The containing directory is handled by ensureConfigDir, which is narrower
+// than it looks, so read the note there before widening it again.
 func (c *Config) Save() error {
 	path, err := Path()
 	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, dirMode); err != nil {
-		return err
-	}
-	// MkdirAll is a no-op when the directory already exists, so it never
-	// tightens a pre-existing 0755 ~/.billkit. Chmod does.
-	if err := os.Chmod(dir, dirMode); err != nil {
+	if err := ensureConfigDir(filepath.Dir(path)); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(c, "", "  ")
@@ -135,6 +141,64 @@ func (c *Config) Save() error {
 		return err
 	}
 	return writeSecretFile(path, data)
+}
+
+// ensureConfigDir makes sure the directory holding config.json exists and is
+// as private as this CLI is entitled to make it.
+//
+// Save used to run os.Chmod(dir, 0700) unconditionally on every write. The
+// intent was right, since MkdirAll only applies its mode to directories it
+// actually creates, so it never tightens a ~/.billkit that already exists at
+// 0755, but the reach was not: BILLKIT_CONFIG_HOME can point at a repo
+// checkout, at $HOME itself, or at a shared CI workspace, and then `billkit
+// login` silently re-moded a directory full of somebody else's files, for
+// everything else in it.
+//
+// So the tightening is now scoped to a directory the CLI can claim:
+//
+//   - one it creates here is 0700 from birth, which is MkdirAll's mode and
+//     which a umask can only narrow further;
+//   - the default ~/.billkit is still chmodded, because it is ours and
+//     nothing else lives in it;
+//   - a pre-existing directory the user named with BILLKIT_CONFIG_HOME is
+//     left exactly as it was, with a warning when group or other can read it.
+//
+// Leaving it alone is safe because the secret is in the file, not in the
+// directory, and writeSecretFile keeps that at 0600 either way. A loose
+// directory lets other accounts *list* it; it does not let them read a key.
+func ensureConfigDir(dir string) error {
+	info, err := os.Stat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return os.MkdirAll(dir, dirMode)
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", dir)
+	}
+	if os.Getenv(configHomeEnv) == "" {
+		return os.Chmod(dir, dirMode)
+	}
+	if msg := looseDirWarning(runtime.GOOS, dir, info.Mode().Perm()); msg != "" {
+		fmt.Fprint(warnWriter, msg)
+	}
+	return nil
+}
+
+// looseDirWarning is the directory counterpart of loosePermWarning, for the
+// one case the CLI will not fix itself. Windows is excluded for the same
+// reason as there: a Go FileMode is one read-only attribute bit, so the
+// group/other bits are synthesised and mean nothing.
+func looseDirWarning(goos, dir string, perm os.FileMode) string {
+	if goos == "windows" || perm&0o077 == 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"! %s is mode %04o: other users on this machine can list the directory holding\n"+
+			"  your BillKit config. The config file itself stays 0600. %s points here, so\n"+
+			"  the CLI leaves a directory it did not create alone.\n"+
+			"  Tighten it yourself with: chmod 700 %s\n", dir, perm, configHomeEnv, dir)
 }
 
 // writeSecretFile writes data to path atomically, owner-only.

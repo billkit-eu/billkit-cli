@@ -2,8 +2,9 @@ name: Release
 
 # Triggered by pushing a tag of the form ``vX.Y.Z``. GoReleaser builds the
 # darwin/linux/windows matrix, signs and notarizes the darwin binaries with the
-# Developer ID certificate, publishes the GitHub release with checksums, and
-# pushes the Homebrew cask to billkit-eu/homebrew-tap.
+# Developer ID certificate, signs checksums.txt with cosign, publishes the
+# GitHub release with checksums, and pushes the Homebrew cask to
+# billkit-eu/homebrew-tap.
 #
 # The runner stays ``ubuntu-latest`` even though the darwin binaries are signed
 # here: GoReleaser's ``notarize.macos`` uses anchore/quill, which signs Mach-O
@@ -25,7 +26,15 @@ on:
       - 'v*'
 
 permissions:
+  # Create the release and upload its assets.
   contents: write
+  # Mint the OIDC token cosign exchanges for a short-lived signing certificate.
+  # This is what keyless signing *is*: without it there is no private key to
+  # fall back on, and the `signs:` block in .goreleaser.yaml fails the release
+  # rather than quietly publishing artifacts install.sh cannot verify the
+  # provenance of. Removing this line breaks the release; it does not weaken it
+  # silently.
+  id-token: write
 
 jobs:
   release:
@@ -41,6 +50,13 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
+
+      # cosign, for the keyless signature over checksums.txt. It signs with the
+      # OIDC token minted by `id-token: write` above and records the signature
+      # in the public Rekor transparency log, so `install.sh` (and anyone else)
+      # can verify that a release came from this workflow, at this tag, without
+      # us publishing and defending a signing key.
+      - uses: sigstore/cosign-installer@v3
 
       - name: Verify the tag matches the declared version
         run: |

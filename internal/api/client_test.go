@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -59,8 +60,8 @@ func TestDoMapsNonSuccessToAPIError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	apiErr, ok := err.(*APIError)
-	if !ok {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
 		t.Fatalf("error type = %T, want *APIError", err)
 	}
 	if apiErr.StatusCode != http.StatusNotFound {
@@ -81,8 +82,8 @@ func TestDoParsesErrorEnvelopeFields(t *testing.T) {
 
 	c := New(srv.URL, "bk_test_x", "1.0", srv.Client())
 	_, err := c.Do(context.Background(), http.MethodPost, "/v1/refunds", map[string]any{})
-	apiErr, ok := err.(*APIError)
-	if !ok {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
 		t.Fatalf("error type = %T", err)
 	}
 	if apiErr.Code != "parameter_invalid" || apiErr.Param != "amount_cents" || apiErr.Reason != "no_active_mandate" {
@@ -332,5 +333,114 @@ func TestSleepForReportsContextCancellation(t *testing.T) {
 	}
 	if !SleepFor(context.Background(), time.Millisecond) {
 		t.Error("SleepFor must report true when the wait completed")
+	}
+}
+
+// TestRetriesIdempotencyInProgress is the one 409 the shared SDK contract
+// retries (sdk/AGENTS.md, "Retry budget"). It means a request carrying this
+// same key is still executing server-side, so the work may already be
+// happening, and the workaround a caller reaches for, a fresh key, is what
+// turns one charge into two. The CLI hits it more than any SDK does: an 80s
+// write that times out is retried immediately, with the key unchanged.
+func TestRetriesIdempotencyInProgress(t *testing.T) {
+	var (
+		mu   sync.Mutex
+		keys []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		keys = append(keys, r.Header.Get("Idempotency-Key"))
+		n := len(keys)
+		mu.Unlock()
+		if n <= 2 {
+			// The API does not currently put a Retry-After on this 409 (only
+			// the 503 and the rate limiter set one), so the CLI falls back to
+			// its own backoff. It is sent here anyway, to pin that the header
+			// is honoured on this code the day the server starts sending it.
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":{"type":"conflict","code":"idempotency_in_progress",` +
+				`"message":"A request with the same Idempotency-Key is currently in progress."}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"re_1"}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "bk_test_x", "1.0", srv.Client())
+	out, err := c.Do(context.Background(), http.MethodPost, "/v1/refunds", map[string]any{"payment_id": "pay_1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != `{"id":"re_1"}` {
+		t.Fatalf("out = %s", out)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keys) != 3 {
+		t.Fatalf("attempts = %d, want 3 (two in-progress answers, then the result)", len(keys))
+	}
+	for _, k := range keys[1:] {
+		if k != keys[0] {
+			t.Fatalf("a retry changed the key (%q then %q): that is a second real charge", keys[0], k)
+		}
+	}
+}
+
+// Every other 409 still fails fast. `idempotency_key_in_use` means the key was
+// used for a *different* body, and repeating it can only get the same answer.
+func TestDoesNotRetryOtherConflicts(t *testing.T) {
+	var hits int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt64(&hits, 1)
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":{"code":"idempotency_key_in_use","message":"reused with a different body"}}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "bk_test_x", "1.0", srv.Client())
+	if _, err := c.Do(context.Background(), http.MethodPost, "/v1/refunds", map[string]any{}); err == nil {
+		t.Fatal("expected the 409 to surface")
+	}
+	if got := atomic.LoadInt64(&hits); got != 1 {
+		t.Fatalf("attempts = %d, want 1: only idempotency_in_progress is worth repeating", got)
+	}
+}
+
+// TestRetriesABodyThatDiesMidRead. roundTrip used to return the real status
+// alongside the read error, so retryableFailure saw a 200 and refused to
+// retry a connection that had delivered headers and then nothing. A body that
+// stops half way through is a transport failure: there is no answer to act on.
+func TestRetriesABodyThatDiesMidRead(t *testing.T) {
+	var hits int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if atomic.AddInt64(&hits, 1) == 1 {
+			// Promise more than we send, then break the connection: the
+			// client reads a short body and reports an unexpected EOF.
+			w.Header().Set("Content-Length", "64")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":`))
+			if hj, ok := w.(http.Hijacker); ok {
+				conn, _, err := hj.Hijack()
+				if err == nil {
+					_ = conn.Close()
+				}
+			}
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"re_1"}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "bk_test_x", "1.0", srv.Client())
+	out, err := c.Do(context.Background(), http.MethodPost, "/v1/refunds", map[string]any{})
+	if err != nil {
+		t.Fatalf("a half-delivered response must be retried, got %v", err)
+	}
+	if string(out) != `{"id":"re_1"}` {
+		t.Fatalf("out = %s", out)
+	}
+	if got := atomic.LoadInt64(&hits); got != 2 {
+		t.Fatalf("attempts = %d, want 2", got)
 	}
 }

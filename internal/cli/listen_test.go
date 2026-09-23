@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/hmac"
@@ -55,7 +56,7 @@ func newTarget(t *testing.T) *target {
 	tg := &target{}
 	tg.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		id, _ := eventMeta(body)
+		id := eventID(body)
 		tg.mu.Lock()
 		tg.ids = append(tg.ids, id)
 		tg.mu.Unlock()
@@ -133,7 +134,6 @@ func testListener(baseURL string, fwd *forwarder, errOut io.Writer) *listener {
 	l := newListener(baseURL, "bk_test_unit", "", fwd, errOut)
 	l.stallTimeout = 150 * time.Millisecond
 	l.stallStep = 15 * time.Millisecond
-	l.settle = 0
 	l.stableFor = time.Hour
 	l.wait = func(ctx context.Context, _ int, _ time.Duration) bool {
 		return api.SleepFor(ctx, 5*time.Millisecond)
@@ -153,27 +153,35 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-// fakeFill is a scripted gap filler, so replay behaviour is asserted without
-// standing up a second API.
-type fakeFill struct {
-	newestID  string
-	newestAt  int64
-	gap       [][]byte
-	truncated bool
-	err       error
-	calls     atomic.Int32
+// fakeAnchor is a scripted seed for the resume cursor, so the start-up path
+// is asserted without standing up a second API.
+type fakeAnchor struct {
+	id  string
+	err error
 }
 
-func (f *fakeFill) newest(context.Context) (string, int64, error) {
-	return f.newestID, f.newestAt, nil
+func (f *fakeAnchor) newest(context.Context) (string, error) { return f.id, f.err }
+
+// cursorLog records the query each connection to the stream carried, which is
+// how the resume behaviour is observed: `starting_after` and `types` are the
+// entire contract between this CLI and the server's replay.
+type cursorLog struct {
+	mu      sync.Mutex
+	cursors []string
+	types   []string
 }
 
-func (f *fakeFill) eventsAfter(_ context.Context, _ string, _ int64) ([][]byte, bool, error) {
-	f.calls.Add(1)
-	if f.err != nil {
-		return nil, false, f.err
-	}
-	return f.gap, f.truncated, nil
+func (c *cursorLog) record(r *http.Request) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cursors = append(c.cursors, r.URL.Query().Get("starting_after"))
+	c.types = append(c.types, r.URL.Query().Get("types"))
+}
+
+func (c *cursorLog) seen() ([]string, []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.cursors), slices.Clone(c.types)
 }
 
 // --- SSE parsing + forwarding (pre-existing behaviour) ---------------------
@@ -201,9 +209,9 @@ func TestConsumeSSEForwardsOnlyMessageFramesWithValidSignature(t *testing.T) {
 		out:    io.Discard,
 		logOut: io.Discard,
 	}
-	onMessage := func(ctx context.Context, event string, data []byte) {
-		if event == "message" {
-			fwd.handle(ctx, data)
+	onMessage := func(ctx context.Context, f sseFrame) {
+		if f.event == "message" && f.dropped == 0 {
+			fwd.handle(ctx, f.data)
 		}
 	}
 
@@ -618,32 +626,36 @@ func TestStreamOnceReturnsStalledRatherThanBlocking(t *testing.T) {
 	}
 }
 
-// --- gap replay ------------------------------------------------------------
+// --- resuming across a reconnect -------------------------------------------
 
-// TestListenReplaysEventsMissedDuringTheGap covers P1-2 and P1-42: the events
-// written while the stream was down must reach the local endpoint, in order,
-// exactly once.
-func TestListenReplaysEventsMissedDuringTheGap(t *testing.T) {
+// TestListenResumesFromTheLastEventItForwarded covers P1-2 and P1-42: the
+// events written while the stream was down must reach the local endpoint, in
+// order, exactly once.
+//
+// The CLI no longer backfills them itself. It hands the server the id of the
+// last event it forwarded and the server replays from there, which is what
+// removed the old walk's 500-event ceiling.
+func TestListenResumesFromTheLastEventItForwarded(t *testing.T) {
 	tg := newTarget(t)
+	log := &cursorLog{}
 	srv := newSSEServer(t,
-		func(w http.ResponseWriter, _ *http.Request) {
+		func(w http.ResponseWriter, r *http.Request) {
+			log.record(r)
 			openSSE(w)
 			sendFrame(w, "message", eventJSON("evt_1", "customer.created", 100))
 		},
 		func(w http.ResponseWriter, r *http.Request) {
+			log.record(r)
 			openSSE(w)
-			// The reconnected stream re-sends evt_2, which the replay has
-			// already delivered: the overlap must be dropped, not doubled.
+			// What the server replays because of the cursor, then live.
 			sendFrame(w, "message", eventJSON("evt_2", "customer.updated", 101))
 			sendFrame(w, "message", eventJSON("evt_3", "invoice.paid", 102))
 			<-r.Context().Done()
 		},
 	)
 
-	fill := &fakeFill{gap: [][]byte{[]byte(eventJSON("evt_2", "customer.updated", 101))}}
 	errOut := &syncBuf{}
 	l := testListener(srv.URL, tg.forwarder(), errOut)
-	l.fill = fill
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -658,51 +670,176 @@ func TestListenReplaysEventsMissedDuringTheGap(t *testing.T) {
 
 	want := []string{"evt_1", "evt_2", "evt_3"}
 	if got := tg.got(); !slices.Equal(got, want) {
-		t.Fatalf("events missed during the gap must be replayed once, in order: got %v, want %v", got, want)
+		t.Fatalf("events must be forwarded once, in order: got %v, want %v", got, want)
 	}
-	if !strings.Contains(errOut.String(), "Replaying 1 event(s)") {
+	cursors, _ := log.seen()
+	if len(cursors) < 2 || cursors[0] != "" || cursors[1] != "evt_1" {
+		t.Fatalf("want a first connection with no cursor and a reconnect resuming after evt_1, got %v", cursors)
+	}
+	if !strings.Contains(errOut.String(), "Replaying anything recorded after evt_1") {
 		t.Errorf("the replay must be reported, got %q", errOut.String())
 	}
 }
 
-// TestListenReportsAGapItCannotReplay is the fallback: when the missed events
-// cannot be fetched, say so and name the command that reconciles them.
-// Silence is the one unacceptable answer.
-func TestListenReportsAGapItCannotReplay(t *testing.T) {
-	srv := newSSEServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		openSSE(w)
-		sendFrame(w, "message", eventJSON("evt_1", "customer.created", 100))
-	})
+// TestListenSendsTheEventsFilterWithTheCursor is the regression test for the
+// bug the server-side cursor closed. The replay used to be a client-side walk
+// of GET /v1/events, which has no multi-type filter, so every reconnect under
+// `--events` forwarded event types the user had explicitly excluded — and the
+// server's idle ceiling makes a reconnect happen roughly hourly.
+func TestListenSendsTheEventsFilterWithTheCursor(t *testing.T) {
+	const filter = "customer.created,invoice.paid"
+	log := &cursorLog{}
+	srv := newSSEServer(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			log.record(r)
+			openSSE(w)
+			sendFrame(w, "message", eventJSON("evt_1", "customer.created", 100))
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			log.record(r)
+			openSSE(w)
+			<-r.Context().Done()
+		},
+	)
 
-	fill := &fakeFill{err: errors.New("event log unreachable")}
-	errOut := &syncBuf{}
-	l := testListener(srv.URL, newTarget(t).forwarder(), errOut)
-	l.fill = fill
+	l := testListener(srv.URL, newTarget(t).forwarder(), &syncBuf{})
+	l.types = filter
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- l.run(ctx) }()
 
-	waitFor(t, "the gap warning", func() bool {
-		return strings.Contains(errOut.String(), "billkit events list")
-	})
+	waitFor(t, "the reconnect", func() bool { return srv.connections() >= 2 })
 	cancel()
 	<-done
 
-	if !strings.Contains(errOut.String(), "Could not read the events missed") {
-		t.Errorf("the warning must say what failed, got %q", errOut.String())
+	cursors, types := log.seen()
+	if len(types) < 2 || types[0] != filter || types[1] != filter {
+		t.Fatalf("every connection must carry the filter, got %v", types)
+	}
+	if len(cursors) < 2 || cursors[1] != "evt_1" {
+		t.Fatalf("the reconnect must carry the cursor alongside the filter, got %v", cursors)
+	}
+}
+
+// TestListenSeedsTheCursorBeforeAnyEventArrives closes the one gap the cursor
+// cannot close on its own: between start-up and the first delivered event
+// there is no id to resume from, so the newest existing event is read once and
+// used as the starting point.
+func TestListenSeedsTheCursorBeforeAnyEventArrives(t *testing.T) {
+	log := &cursorLog{}
+	srv := newSSEServer(t, func(w http.ResponseWriter, r *http.Request) {
+		log.record(r)
+		openSSE(w)
+	})
+
+	l := testListener(srv.URL, newTarget(t).forwarder(), &syncBuf{})
+	l.anchor = &fakeAnchor{id: "evt_0"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- l.run(ctx) }()
+
+	waitFor(t, "the first connection", func() bool { return srv.connections() >= 1 })
+	cancel()
+	<-done
+
+	cursors, _ := log.seen()
+	if len(cursors) == 0 || cursors[0] != "evt_0" {
+		t.Fatalf("the first connection must resume from the seeded cursor, got %v", cursors)
+	}
+}
+
+// TestListenDropsAResumePointTheServerHasPruned is the failure mode the
+// retention sweep creates: the event the cursor names ages out of the log, and
+// from then on every reconnect carrying it is refused with a 400. A 400 is
+// otherwise fatal here, so without this the listener would exit on an event
+// that simply got old. Lossy is acceptable; said out loud is mandatory.
+func TestListenDropsAResumePointTheServerHasPruned(t *testing.T) {
+	tg := newTarget(t)
+	log := &cursorLog{}
+	srv := newSSEServer(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			log.record(r)
+			openSSE(w)
+			sendFrame(w, "message", eventJSON("evt_1", "customer.created", 100))
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			log.record(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"error":{"type":"invalid_request_error","code":"parameter_invalid","message":"No such event for cursor.","param":"starting_after"}}`)
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			log.record(r)
+			openSSE(w)
+			sendFrame(w, "message", eventJSON("evt_9", "invoice.paid", 900))
+			<-r.Context().Done()
+		},
+	)
+
+	errOut := &syncBuf{}
+	l := testListener(srv.URL, tg.forwarder(), errOut)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- l.run(ctx) }()
+
+	waitFor(t, "the stream to recover without its cursor", func() bool {
+		return slices.Contains(tg.got(), "evt_9")
+	})
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("a pruned resume point must not end the command: %v", err)
+	}
+
+	cursors, _ := log.seen()
+	if len(cursors) < 3 || cursors[1] != "evt_1" || cursors[2] != "" {
+		t.Fatalf("want the refused cursor dropped on the next attempt, got %v", cursors)
+	}
+	if !strings.Contains(errOut.String(), "no longer in the event log") ||
+		!strings.Contains(errOut.String(), "billkit events list") {
+		t.Errorf("the loss must be reported with its reconcile command, got %q", errOut.String())
+	}
+}
+
+// TestStaleCursorOnlyMatchesTheCursorParameter keeps the exemption narrow: a
+// 400 about anything else is still the server saying the request is wrong, and
+// retrying it forever while exiting 0 is what this CLI must never do.
+func TestStaleCursorOnlyMatchesTheCursorParameter(t *testing.T) {
+	stale := &streamStatusError{
+		status: http.StatusBadRequest,
+		body:   `{"error":{"code":"parameter_invalid","message":"No such event for cursor.","param":"starting_after"}}`,
+	}
+	if !stale.staleCursor() {
+		t.Error("a 400 naming starting_after is a stale cursor")
+	}
+	badFilter := &streamStatusError{
+		status: http.StatusBadRequest,
+		body:   `{"error":{"code":"parameter_invalid","message":"Unknown event types: nope","param":"types"}}`,
+	}
+	if badFilter.staleCursor() {
+		t.Error("a 400 about the types filter must stay fatal")
+	}
+	if (&streamStatusError{status: http.StatusBadRequest}).staleCursor() {
+		t.Error("a 400 with no envelope says nothing about the cursor")
+	}
+	if (&streamStatusError{status: http.StatusNotFound, body: `{"error":{"param":"starting_after"}}`}).staleCursor() {
+		t.Error("only a 400 can be a stale cursor")
 	}
 }
 
 // TestListenReportsAReconnectWithNoResumePoint covers the case where there is
-// nothing to resume from at all.
+// nothing to resume from at all. Silence is the one unacceptable answer.
 func TestListenReportsAReconnectWithNoResumePoint(t *testing.T) {
 	srv := newSSEServer(t, func(w http.ResponseWriter, _ *http.Request) { openSSE(w) })
 
 	errOut := &syncBuf{}
 	l := testListener(srv.URL, newTarget(t).forwarder(), errOut)
-	l.fill = nil // no event log to replay from
+	l.anchor = nil // no event log to seed a cursor from
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -742,138 +879,55 @@ func TestListenAnnouncesTheServersIdleCeiling(t *testing.T) {
 	<-done
 }
 
-// TestResumeCursorOnlyMovesForward keeps `listen` a tail rather than a history
-// dump: an event older than the cursor must not drag the next replay back past
-// the point the user started listening.
-func TestResumeCursorOnlyMovesForward(t *testing.T) {
-	l := testListener("http://127.0.0.1:1", newTarget(t).forwarder(), &syncBuf{})
-	l.advance("evt_new", 200)
-	l.advance("evt_old", 100)
-	if l.lastID != "evt_new" || l.lastCreated != 200 {
-		t.Fatalf("cursor rewound to %s/%d", l.lastID, l.lastCreated)
-	}
-	// An event in the same second is still an advance, since the log breaks
-	// those ties by id and the walk stops on the id landmark.
-	l.advance("evt_same", 200)
-	if l.lastID != "evt_same" {
-		t.Fatalf("cursor stuck at %s", l.lastID)
-	}
-}
+// --- the cursor seed -------------------------------------------------------
 
-// --- the backfill walk -----------------------------------------------------
-
-func TestGapFillerWalksBackToTheLastSeenEvent(t *testing.T) {
-	// Newest first, as GET /v1/events orders them.
-	log := []string{
-		eventJSON("evt_5", "invoice.paid", 105),
-		eventJSON("evt_4", "customer.updated", 104),
-		eventJSON("evt_3", "customer.created", 103),
-		eventJSON("evt_2", "customer.created", 102),
-		eventJSON("evt_1", "customer.created", 101),
-	}
-	var pages atomic.Int32
+func TestEventAnchorReadsTheNewestEventID(t *testing.T) {
+	var query atomic.Value
+	body := atomic.Value{}
+	body.Store(fmt.Sprintf(`{"object":"list","data":[%s],"has_more":true}`, eventJSON("evt_5", "invoice.paid", 105)))
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		pages.Add(1)
-		start := 0
-		if after := r.URL.Query().Get("starting_after"); after != "" {
-			for i, raw := range log {
-				if id, _ := eventMeta([]byte(raw)); id == after {
-					start = i + 1
-					break
-				}
-			}
-		}
-		end := min(start+2, len(log)) // two rows per page, so the walk pages
+		query.Store(r.URL.RawQuery)
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"object":"list","data":[%s],"has_more":%t}`,
-			strings.Join(log[start:end], ","), end < len(log))
+		fmt.Fprint(w, body.Load().(string))
 	}))
 	defer srv.Close()
 
-	g := &apiGapFiller{client: api.New(srv.URL, "bk_test_unit", "dev", srv.Client())}
-
-	newestID, newestAt, err := g.newest(context.Background())
+	a := &apiEventAnchor{client: api.New(srv.URL, "bk_test_unit", "dev", srv.Client())}
+	id, err := a.newest(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if newestID != "evt_5" || newestAt != 105 {
-		t.Fatalf("newest() = %q/%d, want evt_5/105", newestID, newestAt)
+	if id != "evt_5" {
+		t.Fatalf("newest() = %q, want evt_5", id)
+	}
+	if got := query.Load().(string); got != "limit=1" {
+		t.Errorf("the seed must ask for one row, got %q", got)
 	}
 
-	got, truncated, err := g.eventsAfter(context.Background(), "evt_2", 102)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if truncated {
-		t.Error("a three-event gap is not truncated")
-	}
-	var ids []string
-	for _, raw := range got {
-		id, _ := eventMeta(raw)
-		ids = append(ids, id)
-	}
-	want := []string{"evt_3", "evt_4", "evt_5"}
-	if !slices.Equal(ids, want) {
-		t.Fatalf("replay must be oldest first and stop at the cursor: got %v, want %v", ids, want)
-	}
-	if pages.Load() < 2 {
-		t.Errorf("expected the walk to page, made %d request(s)", pages.Load())
+	// An account that has never emitted an event has no cursor, and that is
+	// not an error: the stream starts from now, which is already correct.
+	body.Store(`{"object":"list","data":[],"has_more":false}`)
+	id, err = a.newest(context.Background())
+	if err != nil || id != "" {
+		t.Fatalf("an empty log must yield no cursor, got %q / %v", id, err)
 	}
 }
 
-func TestGapFillerStopsAtAnOlderEventWhenTheCursorIsGone(t *testing.T) {
-	// evt_2 has been pruned by retention, so the id landmark never matches.
-	log := []string{
-		eventJSON("evt_4", "invoice.paid", 104),
-		eventJSON("evt_3", "customer.created", 103),
-		eventJSON("evt_1", "customer.created", 101),
-	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"object":"list","data":[%s],"has_more":false}`, strings.Join(log, ","))
-	}))
-	defer srv.Close()
+// --- flag validation -------------------------------------------------------
 
-	g := &apiGapFiller{client: api.New(srv.URL, "bk_test_unit", "dev", srv.Client())}
-	got, _, err := g.eventsAfter(context.Background(), "evt_2", 102)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var ids []string
-	for _, raw := range got {
-		id, _ := eventMeta(raw)
-		ids = append(ids, id)
-	}
-	want := []string{"evt_3", "evt_4"}
-	if !slices.Equal(ids, want) {
-		t.Fatalf("the walk must stop at the first older event: got %v, want %v", ids, want)
-	}
-}
-
-func TestGapFillerReportsATruncatedReplay(t *testing.T) {
-	var n atomic.Int64
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		// An endless log, always newer than the cursor.
-		var rows []string
-		for range gapPageSize {
-			i := n.Add(1)
-			rows = append(rows, eventJSON(fmt.Sprintf("evt_%d", i), "customer.created", 9999))
+// TestValidateForwardURL: a --forward-to with no scheme used to be accepted at
+// start-up and then reported once per event as a build error, which reads as a
+// broken webhook handler rather than as a mistyped flag.
+func TestValidateForwardURL(t *testing.T) {
+	for _, ok := range []string{"", "http://localhost:3000/hook", "https://example.test/x"} {
+		if err := validateForwardURL(ok); err != nil {
+			t.Errorf("validateForwardURL(%q) = %v, want nil", ok, err)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"object":"list","data":[%s],"has_more":true}`, strings.Join(rows, ","))
-	}))
-	defer srv.Close()
-
-	g := &apiGapFiller{client: api.New(srv.URL, "bk_test_unit", "dev", srv.Client())}
-	got, truncated, err := g.eventsAfter(context.Background(), "evt_missing", 1)
-	if err != nil {
-		t.Fatal(err)
 	}
-	if !truncated {
-		t.Fatal("a gap longer than the replay cap must be reported as truncated")
-	}
-	if len(got) != gapReplayPages*gapPageSize {
-		t.Fatalf("replay should stop at the cap, got %d events", len(got))
+	for _, bad := range []string{"localhost:3000/hook", "/hook", "ftp://example.test", "http://"} {
+		if err := validateForwardURL(bad); err == nil {
+			t.Errorf("validateForwardURL(%q) must be refused before the stream opens", bad)
+		}
 	}
 }
 
@@ -901,4 +955,291 @@ func validSignature(secret, header string, body []byte) bool {
 	fmt.Fprintf(mac, "%s.", ts)
 	mac.Write(body)
 	return hmac.Equal([]byte(v1), []byte(hex.EncodeToString(mac.Sum(nil))))
+}
+
+// --- oversized frames ------------------------------------------------------
+
+// TestConsumeSSESkipsAnOversizedEventAndKeepsGoing is the regression for a
+// deterministic livelock. The parser used to be a bufio.Scanner, which fails
+// the whole connection on a token longer than its buffer; once `listen`
+// resumed from a cursor, the server replayed the same oversized event on every
+// reconnect and the listener spun on one row forever at a growing backoff,
+// looking alive the whole time.
+func TestConsumeSSESkipsAnOversizedEventAndKeepsGoing(t *testing.T) {
+	pad := strings.Repeat("x", maxSSEFrameBytes+4096)
+	stream := "id: evt_big\nevent: message\ndata: {\"id\":\"evt_big\",\"pad\":\"" + pad + "\"}\n\n" +
+		"id: evt_next\nevent: message\ndata: {\"id\":\"evt_next\"}\n\n"
+
+	var frames []sseFrame
+	if err := consumeSSE(context.Background(), strings.NewReader(stream),
+		func(_ context.Context, f sseFrame) { frames = append(frames, f) }); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(frames) != 2 {
+		t.Fatalf("the stream must keep moving past the oversized event, got %d frame(s)", len(frames))
+	}
+	if frames[0].dropped == 0 {
+		t.Error("the oversized frame must be marked incomplete")
+	}
+	if frames[0].id != "evt_big" {
+		t.Errorf("the id: field survives a payload that does not: got %q", frames[0].id)
+	}
+	// Half an event that still parses as JSON is the worst thing a webhook
+	// relay can deliver, so nothing of it is retained.
+	if len(frames[0].data) != 0 {
+		t.Errorf("an incomplete frame must carry no data, got %d byte(s)", len(frames[0].data))
+	}
+	if frames[1].dropped != 0 || string(frames[1].data) != `{"id":"evt_next"}` {
+		t.Errorf("the next event must arrive intact, got %+v", frames[1])
+	}
+}
+
+// TestListenReportsAndStepsPastAnOversizedEvent is the same thing one layer
+// up: the loss is named, the command that reads the event is printed, and the
+// cursor moves past it so the next reconnect does not stall on the same row.
+func TestListenReportsAndStepsPastAnOversizedEvent(t *testing.T) {
+	tg := newTarget(t)
+	pad := strings.Repeat("x", maxSSEFrameBytes+4096)
+	srv := newSSEServer(t, func(w http.ResponseWriter, r *http.Request) {
+		openSSE(w)
+		fmt.Fprintf(w, "id: evt_big\nevent: message\ndata: {\"id\":\"evt_big\",\"pad\":\"%s\"}\n\n", pad)
+		w.(http.Flusher).Flush()
+		sendFrame(w, "message", eventJSON("evt_small", "customer.created", 101))
+		<-r.Context().Done()
+	})
+
+	errOut := &syncBuf{}
+	l := testListener(srv.URL, tg.forwarder(), errOut)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- l.run(ctx) }()
+
+	waitFor(t, "the event after the oversized one", func() bool {
+		return slices.Contains(tg.got(), "evt_small")
+	})
+	cancel()
+	<-done
+
+	if slices.Contains(tg.got(), "evt_big") {
+		t.Fatal("an event that could not be buffered whole must never be forwarded")
+	}
+	out := errOut.String()
+	if !strings.Contains(out, "evt_big") || !strings.Contains(out, "NOT forwarded") {
+		t.Errorf("the skipped event must be named, got %q", out)
+	}
+	if !strings.Contains(out, "billkit events retrieve evt_big") {
+		t.Errorf("the notice must say how to read it, got %q", out)
+	}
+	if l.resumeAfter != "evt_small" {
+		t.Errorf("resumeAfter = %q; the cursor must have moved past the oversized row", l.resumeAfter)
+	}
+}
+
+func TestSSELine(t *testing.T) {
+	t.Run("plain lines, CRLF and LF alike", func(t *testing.T) {
+		br := bufio.NewReaderSize(strings.NewReader("a\r\nbb\n\n"), 16)
+		for _, want := range []string{"a", "bb", ""} {
+			got, dropped, err := sseLine(br, 64)
+			if err != nil || dropped != 0 || got != want {
+				t.Fatalf("sseLine = %q/%d/%v, want %q", got, dropped, err, want)
+			}
+		}
+	})
+
+	t.Run("a line longer than the limit is truncated, not fatal", func(t *testing.T) {
+		br := bufio.NewReaderSize(strings.NewReader(strings.Repeat("y", 100)+"\nnext\n"), 16)
+		got, dropped, err := sseLine(br, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// 91, not 90: the line terminator lands on the dropped side too, so
+		// the count the user sees is a lower bound and is worded as one.
+		if len(got) != 10 || dropped != 91 {
+			t.Fatalf("kept %d, dropped %d; want exactly the limit kept and the rest dropped", len(got), dropped)
+		}
+		// The reader is left positioned on the next line, which is the whole
+		// point: the frame is skipped, the stream is not.
+		got, dropped, err = sseLine(br, 10)
+		if err != nil || dropped != 0 || got != "next" {
+			t.Fatalf("sseLine after an overflow = %q/%d/%v", got, dropped, err)
+		}
+	})
+
+	t.Run("a final line the server never terminated is still a line", func(t *testing.T) {
+		br := bufio.NewReaderSize(strings.NewReader("tail"), 16)
+		got, _, err := sseLine(br, 64)
+		if err != nil || got != "tail" {
+			t.Fatalf("sseLine = %q/%v, want tail", got, err)
+		}
+		if _, _, err = sseLine(br, 64); !errors.Is(err, io.EOF) {
+			t.Fatalf("the read after it must be EOF, got %v", err)
+		}
+	})
+}
+
+// TestForwardedHeadersMatchTheRealDispatcher. `listen` exists so code written
+// against it works unchanged in production, and the header set is most of
+// that promise. BillKit-Event-Id was missing, so a handler that deduped on it
+// read an empty string locally, passed every local test, and deduped nothing
+// once deployed. api/tests/test_cli_webhook_headers.py pins the same set from
+// the other side, against webhook_dispatcher.py itself.
+func TestForwardedHeadersMatchTheRealDispatcher(t *testing.T) {
+	var got http.Header
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	fwd := &forwarder{
+		url:    target.URL,
+		secret: "bkwhsec_unit_test",
+		client: target.Client(),
+		out:    io.Discard,
+		logOut: io.Discard,
+	}
+	raw := []byte(`{"id":"evt_42","type":"customer.created"}`)
+	fwd.handle(context.Background(), raw)
+
+	want := map[string]string{
+		"Content-Type":             "application/json",
+		"BillKit-Event-Id":         "evt_42",
+		"BillKit-Event-Type":       "customer.created",
+		"BillKit-Delivery-Attempt": "1",
+	}
+	for header, value := range want {
+		if have := got.Get(header); have != value {
+			t.Errorf("%s = %q, want %q", header, have, value)
+		}
+	}
+	// Both identities: the dispatcher's, so a handler that matches on it
+	// behaves the same, and the CLI's, so a log can still tell them apart.
+	ua := got.Get("User-Agent")
+	if !strings.HasPrefix(ua, "BillKit-Webhook/1.0") || !strings.Contains(ua, "billkit-cli/") {
+		t.Errorf("User-Agent = %q, want the dispatcher's identity plus this CLI's", ua)
+	}
+	if !validSignature("bkwhsec_unit_test", got.Get("BillKit-Signature"), raw) {
+		t.Errorf("BillKit-Signature %q does not verify", got.Get("BillKit-Signature"))
+	}
+}
+
+// TestForwardRetriesAConnectionFailure. `deliver` advances the resume cursor
+// after handle() returns, so a forward that failed used to be a permanent
+// loss: the one second a dev server spends restarting on a file save ate the
+// event, the listener still looked healthy, and nothing was coming back.
+func TestForwardRetriesAConnectionFailure(t *testing.T) {
+	var hits int64
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if atomic.AddInt64(&hits, 1) <= 2 {
+			// Refuse this delivery the way a restarting server does: accept
+			// nothing and drop the connection before answering.
+			if hj, ok := w.(http.Hijacker); ok {
+				conn, _, err := hj.Hijack()
+				if err == nil {
+					_ = conn.Close()
+					return
+				}
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	var log strings.Builder
+	fwd := &forwarder{
+		url:     target.URL,
+		secret:  "bkwhsec_unit_test",
+		client:  target.Client(),
+		out:     io.Discard,
+		logOut:  &log,
+		backoff: []time.Duration{time.Millisecond, time.Millisecond},
+	}
+	fwd.handle(context.Background(), []byte(`{"id":"evt_1","type":"customer.created"}`))
+
+	if got := atomic.LoadInt64(&hits); got != 3 {
+		t.Fatalf("delivery attempts = %d, want 3 (two refused, then accepted)", got)
+	}
+	if !strings.Contains(log.String(), "-> 200") {
+		t.Fatalf("the successful delivery must be reported: %q", log.String())
+	}
+}
+
+// When the retries run out the loss is stated, with the command that reads
+// the event back. Silence is the one option that is not allowed here.
+func TestForwardReportsAnExhaustedDelivery(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := srv.URL
+	client := srv.Client()
+	srv.Close() // nothing is listening any more, so every attempt fails to dial
+
+	var log strings.Builder
+	fwd := &forwarder{
+		url:     url,
+		secret:  "bkwhsec_unit_test",
+		client:  client,
+		out:     io.Discard,
+		logOut:  &log,
+		backoff: []time.Duration{time.Millisecond, time.Millisecond},
+	}
+	fwd.handle(context.Background(), []byte(`{"id":"evt_9","type":"customer.created"}`))
+
+	out := log.String()
+	if !strings.Contains(out, "NOT forwarded after 3 attempts") {
+		t.Errorf("the loss must be named: %q", out)
+	}
+	if !strings.Contains(out, "billkit events retrieve evt_9") {
+		t.Errorf("the recovery command must be printed: %q", out)
+	}
+}
+
+// An HTTP answer of any status is final. A 500 is the developer's handler
+// answering this event; re-posting the same body into a local app that
+// already ran it manufactures duplicates the production dispatcher's own
+// schedule would not.
+func TestForwardDoesNotRetryAnHTTPFailure(t *testing.T) {
+	var hits int64
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt64(&hits, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer target.Close()
+
+	fwd := &forwarder{
+		url:     target.URL,
+		secret:  "bkwhsec_unit_test",
+		client:  target.Client(),
+		out:     io.Discard,
+		logOut:  io.Discard,
+		backoff: []time.Duration{time.Millisecond, time.Millisecond},
+	}
+	fwd.handle(context.Background(), []byte(`{"id":"evt_1","type":"customer.created"}`))
+
+	if got := atomic.LoadInt64(&hits); got != 1 {
+		t.Fatalf("delivery attempts = %d, want 1: an HTTP status is an answer", got)
+	}
+}
+
+// TestConsumeSSEDefaultsToTheMessageEventType. The SSE spec says a frame with
+// data and no `event:` line is a "message". BillKit always writes
+// `event: message` (api/billkit/api/events.py, _sse), so this is a contract
+// guard: an intermediary that strips the line must not turn every event into
+// a silent drop.
+func TestConsumeSSEDefaultsToTheMessageEventType(t *testing.T) {
+	var seen []sseFrame
+	stream := "data: {\"id\":\"evt_1\",\"type\":\"customer.created\"}\n\n"
+	err := consumeSSE(context.Background(), strings.NewReader(stream), func(_ context.Context, f sseFrame) {
+		seen = append(seen, f)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 1 {
+		t.Fatalf("frames = %d, want 1: a frame with no `event:` line was dropped", len(seen))
+	}
+	if seen[0].event != "message" {
+		t.Fatalf("event = %q, want %q", seen[0].event, "message")
+	}
 }
