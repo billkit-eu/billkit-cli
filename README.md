@@ -178,6 +178,10 @@ billkit refunds retrieve re_123
 billkit checkout one-shot \
   --customer cus_123 --amount 1999 --method ideal \
   --success-url https://example.com/thanks
+# ...or one paid inside your own page: no --method, prints a client_secret
+billkit checkout one-shot --ui-mode embedded \
+  --customer cus_123 --amount 1999 \
+  --success-url https://example.com/thanks
 billkit checkout retrieve osp_123
 ```
 
@@ -185,6 +189,10 @@ billkit checkout retrieve osp_123
 `applepay`, `paypal`, `banktransfer`. `--tax-behavior inclusive|exclusive` says
 whether `--amount` is quoted gross or net; omit it to inherit the country
 default, and read the response's `amount_cents` for what was actually charged.
+`--ui-mode embedded` takes no `--method` (the customer picks it in the BillKit
+payment element) and prints the payment with a short-lived `client_secret` to
+hand to `@billkit-eu/js` instead of a `redirect_url`. Passing `--method` with
+it, or omitting `--method` without it, is a usage error (exit 2).
 
 Every mutating call carries an `Idempotency-Key`: yours via
 `--idempotency-key`, otherwise one the CLI mints and prints on stderr before

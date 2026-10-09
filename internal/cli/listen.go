@@ -785,8 +785,8 @@ func validateForwardURL(raw string) error {
 }
 
 // forwardBackoff is the pause before each retry of a failed local delivery.
-// Its length is also the attempt budget: three attempts in total, spread over
-// a little under four seconds, which covers the restart of a dev server
+// Its length is also the retry budget: three retries after the first try, four
+// attempts in total, spread over a little under four seconds, which covers the restart of a dev server
 // without holding the stream up long enough to matter.
 var forwardBackoff = []time.Duration{250 * time.Millisecond, time.Second, 2 * time.Second}
 

@@ -49,6 +49,7 @@ func checkoutOneShotCmd(g *globals) *cobra.Command {
 		amount           int64
 		currency         string
 		method           string
+		uiMode           string
 		successURL       string
 		cancelURL        string
 		description      string
@@ -60,10 +61,18 @@ func checkoutOneShotCmd(g *globals) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "one-shot",
 		Short: "Create a single off-session charge (no subscription, no saved mandate)",
-		Long: "Create a one-off `sequenceType=oneoff` charge and print the payment,\n" +
-			"including the Mollie hosted `redirect_url` to send the customer to.\n\n" +
+		Long: "Create a one-off `sequenceType=oneoff` charge and print the payment.\n\n" +
+			"Hosted (the default) needs --method and prints the Mollie hosted\n" +
+			"`redirect_url` to send the customer to:\n\n" +
 			"  billkit checkout one-shot \\\n" +
 			"    --customer cus_123 --amount 1999 --method ideal \\\n" +
+			"    --success-url https://example.com/thanks\n\n" +
+			"--ui-mode embedded takes no --method: the customer picks it in the\n" +
+			"BillKit payment element on your own page, and the payment is printed\n" +
+			"with a short-lived `client_secret` for that element instead of a\n" +
+			"redirect URL:\n\n" +
+			"  billkit checkout one-shot --ui-mode embedded \\\n" +
+			"    --customer cus_123 --amount 1999 \\\n" +
 			"    --success-url https://example.com/thanks",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -76,6 +85,7 @@ func checkoutOneShotCmd(g *globals) *cobra.Command {
 				amount:           amount,
 				currency:         currency,
 				method:           method,
+				uiMode:           uiMode,
 				successURL:       successURL,
 				cancelURL:        cancelURL,
 				description:      description,
@@ -87,12 +97,18 @@ func checkoutOneShotCmd(g *globals) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// What the confirmation line names. An embedded one-shot has no
+			// method yet, and "via " followed by nothing reads like a bug.
+			via := "via " + method
+			if uiMode == "embedded" {
+				via = "in the embedded payment element"
+			}
 			out, err := runMutating(cmd, g, mutatingCall{
 				method:   "POST",
 				path:     "/v1/checkout/one_shot",
 				body:     body,
 				moves:    true,
-				what:     fmt.Sprintf("charge %d %s to %s via %s", amount, currency, customer, method),
+				what:     fmt.Sprintf("charge %d %s to %s %s", amount, currency, customer, via),
 				checkCmd: "billkit events list --type one_shot_payment.created",
 				idemKey:  idemKey,
 			})
@@ -106,7 +122,8 @@ func checkoutOneShotCmd(g *globals) *cobra.Command {
 	cmd.Flags().StringVar(&customer, "customer", "", "customer id to charge (required)")
 	cmd.Flags().Int64Var(&amount, "amount", 0, "amount to charge in cents (required)")
 	cmd.Flags().StringVar(&currency, "currency", "EUR", "ISO-4217 currency code")
-	cmd.Flags().StringVar(&method, "method", "", "payment method: "+joinMethods()+" (required)")
+	cmd.Flags().StringVar(&method, "method", "", "payment method: "+joinMethods()+" (required for --ui-mode hosted, refused for embedded)")
+	cmd.Flags().StringVar(&uiMode, "ui-mode", "", "hosted (redirect to Mollie, the default) or embedded (returns a client_secret for the payment element)")
 	cmd.Flags().StringVar(&successURL, "success-url", "", "URL to redirect to after a successful payment (required)")
 	cmd.Flags().StringVar(&cancelURL, "cancel-url", "", "URL to redirect to if the customer cancels")
 	cmd.Flags().StringVar(&description, "description", "", "statement/description shown to the customer")
@@ -120,10 +137,12 @@ func checkoutOneShotCmd(g *globals) *cobra.Command {
 	cmd.Flags().StringVar(&idemKey, "idempotency-key", "", "Idempotency-Key for safe retries")
 	_ = cmd.MarkFlagRequired("customer")
 	_ = cmd.MarkFlagRequired("amount")
-	_ = cmd.MarkFlagRequired("method")
 	_ = cmd.MarkFlagRequired("success-url")
 	_ = cmd.RegisterFlagCompletionFunc("method", func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
 		return oneShotMethods, cobra.ShellCompDirectiveNoFileComp
+	})
+	_ = cmd.RegisterFlagCompletionFunc("ui-mode", func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
+		return uiModes, cobra.ShellCompDirectiveNoFileComp
 	})
 	_ = cmd.RegisterFlagCompletionFunc("tax-behavior", func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
 		return taxBehaviors, cobra.ShellCompDirectiveNoFileComp
@@ -136,6 +155,7 @@ type oneShotParams struct {
 	amount           int64
 	currency         string
 	method           string
+	uiMode           string
 	successURL       string
 	cancelURL        string
 	description      string
@@ -151,19 +171,47 @@ type oneShotParams struct {
 // the command line and the response's amount_cents says so.
 var taxBehaviors = []string{"inclusive", "exclusive"}
 
+// uiModes mirrors the API's `ui_mode` literal on OneShotPaymentCreate.
+// "hosted" redirects the customer to Mollie and needs a method up front;
+// "embedded" returns a client_secret for the BillKit payment element, where
+// the customer picks the method, so it must be sent without one.
+var uiModes = []string{"hosted", "embedded"}
+
 func buildOneShotBody(p oneShotParams) (map[string]any, error) {
 	if p.amount <= 0 {
 		return nil, fmt.Errorf("--amount must be a positive number of cents")
 	}
-	if !validMethod(p.method) {
+	// Both refusals below are a bad invocation (exit 2), not a failed call:
+	// the server would answer 422 for either, and saying so here names the
+	// flag to fix rather than an API field.
+	if p.uiMode != "" && !slices.Contains(uiModes, p.uiMode) {
+		return nil, &UsageError{fmt.Errorf("--ui-mode %q is not one of %s", p.uiMode, strings.Join(uiModes, ", "))}
+	}
+	embedded := p.uiMode == "embedded"
+	switch {
+	case embedded && p.method != "":
+		return nil, &UsageError{fmt.Errorf("--method cannot be used with --ui-mode embedded: the customer picks the method in the payment element")}
+	case !embedded && p.method == "":
+		return nil, &UsageError{fmt.Errorf("--method is required unless --ui-mode is embedded (one of %s)", joinMethods())}
+	case !embedded && !validMethod(p.method):
 		return nil, fmt.Errorf("--method %q is not one of %s", p.method, joinMethods())
 	}
 	body := map[string]any{
 		"customer_id":  p.customer,
 		"amount_cents": p.amount,
 		"currency":     p.currency,
-		"method":       p.method,
 		"success_url":  p.successURL,
+	}
+	if embedded {
+		body["ui_mode"] = p.uiMode
+	} else {
+		body["method"] = p.method
+		// An explicit --ui-mode hosted is sent, so what was typed is what the
+		// server sees; an omitted one is not, which keeps the body of every
+		// existing invocation byte-for-byte unchanged.
+		if p.uiMode != "" {
+			body["ui_mode"] = p.uiMode
+		}
 	}
 	if p.cancelURL != "" {
 		body["cancel_url"] = p.cancelURL

@@ -30,7 +30,7 @@ import (
 // version that disagrees with it, and the mirror's publish workflow re-checks
 // the pushed tag against it before GoReleaser runs. So bump it here, split, then
 // tag. See sdk/RELEASING.md.
-var Version = "0.3.0"
+var Version = "0.4.0"
 
 // globals holds the values behind the root command's persistent flags.
 //
@@ -88,7 +88,6 @@ func rootCmd() *cobra.Command {
 	root.PersistentFlags().StringVar(&g.apiKey, "api-key", "", "API key for this call; prefer BILLKIT_API_KEY, since a flag value is visible in the process list and in shell history")
 	root.PersistentFlags().StringVar(&g.baseURL, "base-url", "", "API host override (env: BILLKIT_BASE_URL; default: https://api.billkit.eu)")
 	root.PersistentFlags().StringVar(&g.color, "color", "auto", "colorize JSON output: auto, always, or never")
-	// Named to match the internal `bill` CLI's global --yes/-y.
 	root.PersistentFlags().BoolVarP(&g.yes, "yes", "y", false, "confirm live-mode money commands without prompting (required in scripts)")
 
 	root.AddCommand(

@@ -3,6 +3,77 @@ package cli
 import "testing"
 
 func TestBuildOneShotBody(t *testing.T) {
+	t.Run("embedded sends ui_mode and no method", func(t *testing.T) {
+		body, err := buildOneShotBody(oneShotParams{
+			customer: "cus_1", amount: 1999, currency: "EUR", uiMode: "embedded",
+			successURL: "https://x.test/ok",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if body["ui_mode"] != "embedded" {
+			t.Fatalf("ui_mode = %v, body = %v", body["ui_mode"], body)
+		}
+		if _, ok := body["method"]; ok {
+			t.Fatalf("method must be omitted for embedded, body = %v", body)
+		}
+	})
+
+	t.Run("embedded with a method is a usage error", func(t *testing.T) {
+		_, err := buildOneShotBody(oneShotParams{
+			customer: "cus_1", amount: 1, currency: "EUR", uiMode: "embedded", method: "ideal",
+			successURL: "https://x.test/ok",
+		})
+		if err == nil {
+			t.Fatal("expected an error for --method with --ui-mode embedded")
+		}
+		if ExitCode(err) != ExitUsage {
+			t.Fatalf("ExitCode = %d, want %d (err: %v)", ExitCode(err), ExitUsage, err)
+		}
+	})
+
+	t.Run("hosted without a method is a usage error", func(t *testing.T) {
+		for _, mode := range []string{"", "hosted"} {
+			_, err := buildOneShotBody(oneShotParams{
+				customer: "cus_1", amount: 1, currency: "EUR", uiMode: mode, successURL: "https://x.test/ok",
+			})
+			if err == nil || ExitCode(err) != ExitUsage {
+				t.Fatalf("ui-mode %q: want a usage error, got %v", mode, err)
+			}
+		}
+	})
+
+	t.Run("unknown ui mode is a usage error", func(t *testing.T) {
+		_, err := buildOneShotBody(oneShotParams{
+			customer: "cus_1", amount: 1, currency: "EUR", uiMode: "iframe", successURL: "https://x.test/ok",
+		})
+		if err == nil || ExitCode(err) != ExitUsage {
+			t.Fatalf("want a usage error, got %v", err)
+		}
+	})
+
+	t.Run("explicit hosted is sent, omitted is not", func(t *testing.T) {
+		explicit, err := buildOneShotBody(oneShotParams{
+			customer: "cus_1", amount: 1, currency: "EUR", uiMode: "hosted", method: "ideal",
+			successURL: "https://x.test/ok",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if explicit["ui_mode"] != "hosted" || explicit["method"] != "ideal" {
+			t.Fatalf("body = %v", explicit)
+		}
+		omitted, err := buildOneShotBody(oneShotParams{
+			customer: "cus_1", amount: 1, currency: "EUR", method: "ideal", successURL: "https://x.test/ok",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := omitted["ui_mode"]; ok {
+			t.Fatalf("ui_mode must be omitted when not given, body = %v", omitted)
+		}
+	})
+
 	t.Run("minimal required fields", func(t *testing.T) {
 		body, err := buildOneShotBody(oneShotParams{
 			customer:   "cus_1",
@@ -19,7 +90,7 @@ func TestBuildOneShotBody(t *testing.T) {
 			t.Fatalf("body = %v", body)
 		}
 		// Optional fields are omitted when unset.
-		for _, k := range []string{"cancel_url", "description", "refund_window_days", "metadata"} {
+		for _, k := range []string{"cancel_url", "description", "refund_window_days", "metadata", "ui_mode"} {
 			if _, ok := body[k]; ok {
 				t.Fatalf("expected %q omitted, body = %v", k, body)
 			}

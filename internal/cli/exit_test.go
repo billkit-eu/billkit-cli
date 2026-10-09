@@ -21,6 +21,14 @@ func TestExitCodeSeparatesUsageFromFailure(t *testing.T) {
 		{"too few arguments", []string{"api", "GET"}, ExitUsage},
 		{"too many arguments", []string{"events", "retrieve", "evt_1", "evt_2"}, ExitUsage},
 		{"a bad flag value", []string{"events", "list", "--limit", "banana"}, ExitUsage},
+		// Rejected before any request is built, so no credentials are needed.
+		{"embedded one-shot with a method", []string{
+			"checkout", "one-shot", "--ui-mode", "embedded", "--method", "ideal",
+			"--customer", "cus_1", "--amount", "100", "--success-url", "https://x.test/ok",
+		}, ExitUsage},
+		{"hosted one-shot with no method", []string{
+			"checkout", "one-shot", "--customer", "cus_1", "--amount", "100", "--success-url", "https://x.test/ok",
+		}, ExitUsage},
 		// Ran fine as an invocation; the call itself could not be made.
 		{"no credentials", []string{"events", "list", "--base-url", "https://api.example.test"}, ExitFailure},
 	}

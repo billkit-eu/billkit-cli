@@ -59,6 +59,7 @@ var knownEventTypes = map[string]struct{}{
 	"invoice.payment_failed":       {},
 	"invoice.voided":               {},
 	"invoice.marked_uncollectible": {},
+	"invoice.upcoming":             {},
 	"credit_note.created":          {},
 	// Catalogue
 	"product.created":  {},
