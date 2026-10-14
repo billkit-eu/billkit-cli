@@ -20,7 +20,7 @@ import (
 // use` and `logout` already operate on one, so login was the only place that
 // pretended the set was fixed at {test, live}: `--profile staging` was
 // accepted on the command line, silently ignored, and the key landed under
-// "test" — which the next `--profile staging` then could not find.
+// "test", which the next `--profile staging` then could not find.
 //
 // The one name it refuses is the other mode's. "test" and "live" are the names
 // the CLI assigns from the key prefix, and they are what `config list`,
@@ -33,7 +33,7 @@ func loginProfileName(g *globals, mode string) (string, error) {
 		return mode, nil
 	}
 	if other := map[string]string{"test": "live", "live": "test"}[name]; other == mode {
-		return "", fmt.Errorf(
+		return "", usageErrorf(
 			"refusing to store a %s key under the profile name %q: that name is reserved for %s keys, "+
 				"and `billkit config list` would report this one as %s. Pick another name, or omit --profile to use %q",
 			mode, name, name, name, mode)
@@ -42,17 +42,24 @@ func loginProfileName(g *globals, mode string) (string, error) {
 }
 
 func loginCmd(g *globals) *cobra.Command {
-	return &cobra.Command{
+	var insecureStorage bool
+	cmd := &cobra.Command{
 		Use:   "login",
 		Short: "Store an API key for a profile",
-		Long: "Store a BillKit API key (bk_test_… / bk_live_…) in ~/.billkit/config.json.\n" +
-			"The key's prefix names the profile (test/live) unless --profile says\n" +
-			"otherwise, and the key is validated against the API before being saved.\n\n" +
+		Long: "Validate a BillKit API key (bk_test_… / bk_live_…) against the API and\n" +
+			"store it. The key's prefix names the profile (test/live) unless --profile\n" +
+			"says otherwise.\n\n" +
 			"  billkit login --profile staging   # store under a name of your choosing\n\n" +
+			"A live key is kept in the OS keychain (macOS Keychain, Windows Credential\n" +
+			"Manager, or the Secret Service on Linux) and the config file records only\n" +
+			"where. When no keychain is available, as on a headless Linux box or in CI,\n" +
+			"it goes in the config file (mode 0600) and login says so. Test keys always\n" +
+			"go in the file. --insecure-storage puts a live key in the file on purpose.\n\n" +
 			"The prompt does not echo what you type. To skip it non-interactively,\n" +
 			"set BILLKIT_API_KEY or pipe the key in (`cat key.txt | billkit login`).\n" +
 			"--api-key works too but puts the secret in the process list and in your\n" +
 			"shell history, so prefer either of the other two.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			key, source := apiKeyOverride(g)
 			switch {
@@ -67,11 +74,11 @@ func loginCmd(g *globals) *cobra.Command {
 				// Say which identity is being stored. Someone who exported the
 				// variable in a previous shell and then ran `billkit login`
 				// expecting a prompt has to be told why there wasn't one.
-				fmt.Fprintf(cmd.ErrOrStderr(), "> Using the API key from $%s.\n", envAPIKey)
+				fmt.Fprintf(g.notices(cmd.ErrOrStderr()), "> Using the API key from $%s.\n", envAPIKey)
 			}
 			mode := config.Mode(key)
 			if mode == "" {
-				return fmt.Errorf("that doesn't look like a BillKit key (expected bk_test_… or bk_live_…)")
+				return &AuthError{errors.New("that doesn't look like a BillKit key (expected bk_test_… or bk_live_…)")}
 			}
 			// Before the key reaches the wire. A name this command is going to
 			// refuse should not cost a round trip first, and "your key is
@@ -89,6 +96,11 @@ func loginCmd(g *globals) *cobra.Command {
 			if err := config.CheckTransport(baseURL, key); err != nil {
 				return err
 			}
+			// Same notice every other command gives, and login needs it
+			// most: it is the command that sends a key nothing has used yet
+			// to a host nothing has talked to yet, and a BILLKIT_BASE_URL
+			// left over from another shell used to receive it silently.
+			announceHost(g.notices(cmd.ErrOrStderr()), g, creds{baseURL: baseURL})
 
 			// Validate the key with a cheap authenticated call.
 			//
@@ -118,27 +130,43 @@ func loginCmd(g *globals) *cobra.Command {
 				}
 			}
 
-			cfg, err := config.Load()
-			if err != nil {
-				return err
-			}
-			p := config.Profile{APIKey: key}
+			storedBase := ""
 			if baseURL != config.DefaultBaseURL {
-				p.BaseURL = baseURL
+				storedBase = baseURL
 			}
-			cfg.Set(name, p)
-			// The profile you just authenticated is the one you meant to use.
-			// Without this, logging in with a test key while a live key was
-			// already stored leaves every later command on the live key --
-			// the CLI says "test mode" and then spends real money.
-			cfg.SetDefault(name)
-			if err := cfg.Save(); err != nil {
+			// Under the config lock from read to write: two logins at once
+			// used to each store a keychain entry and write a file naming
+			// their own, and the loser's live key stayed in the keychain
+			// referenced by nothing.
+			var res config.StoreResult
+			if err := config.Update(func(cfg *config.Config) error {
+				res = cfg.StoreKey(name, key, storedBase, config.StoreOptions{AllowKeychain: !insecureStorage})
+				// The profile you just authenticated is the one you meant
+				// to use. Without this, logging in with a test key while a
+				// live key was already stored leaves every later command on
+				// the live key -- the CLI says "test mode" and then spends
+				// real money.
+				cfg.SetDefault(name)
+				return nil
+			}); err != nil {
 				return err
 			}
 
+			// All of this is a message, not data, so it goes to stderr:
+			// `billkit login` has no machine output.
+			errw := cmd.ErrOrStderr()
 			path, _ := config.Path()
-			fmt.Fprintf(cmd.OutOrStdout(), "✓ Logged in (%s mode). Profile %q is now the default. Credentials saved to %s\n", mode, name, path)
+			where := path
+			if res.Storage == "keychain" {
+				where = fmt.Sprintf("the OS keychain (service %q), referenced from %s", config.KeyringService, path)
+			}
+			fmt.Fprintf(g.notices(errw), "✓ Logged in (%s mode). Profile %q is now the default. Key stored in %s\n", mode, name, where)
+			if res.KeychainErr != nil {
+				fmt.Fprintf(errw, "! The OS keychain was not available (%v), so this live key is stored in %s (mode 0600) instead.\n", res.KeychainErr, path)
+			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&insecureStorage, "insecure-storage", false, "store a live key in the config file instead of the OS keychain")
+	return cmd
 }

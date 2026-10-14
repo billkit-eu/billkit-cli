@@ -4,6 +4,8 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -55,16 +57,16 @@ var triggers = map[string]func(ctx context.Context, c *api.Client) ([]byte, erro
 		}
 		return c.Do(ctx, "POST", "/v1/customers/"+idOf(created), map[string]any{"name": "Renamed by CLI"})
 	},
-	// The emit site is purge, not delete: DELETE /v1/customers/{id} hides the
-	// customer and emits nothing, while POST /v1/customers/{id}/purge is the
-	// GDPR erasure and carries the pre-purge snapshot
-	// (services/customers.py). `confirmed` must be true or the API refuses.
+	// A plain DELETE: services/customers.py's delete_customer emits
+	// customer.deleted. This used to go through POST .../purge, from when
+	// DELETE emitted nothing; purge is the GDPR erasure, which also redacts
+	// the customer's earlier events, and is far more than a trigger needs.
 	"customer.deleted": func(ctx context.Context, c *api.Client) ([]byte, error) {
 		created, err := c.Do(ctx, "POST", "/v1/customers", map[string]any{"email": "cli-del@example.com"})
 		if err != nil {
 			return nil, err
 		}
-		return c.Do(ctx, "POST", "/v1/customers/"+idOf(created)+"/purge", map[string]any{"confirmed": true})
+		return c.Do(ctx, "DELETE", "/v1/customers/"+idOf(created), nil)
 	},
 	"product.created": func(ctx context.Context, c *api.Client) ([]byte, error) {
 		return c.Do(ctx, "POST", "/v1/products", map[string]any{"name": "CLI Trigger Product"})
@@ -185,9 +187,8 @@ func triggerPriceBody(productID string) map[string]any {
 // that works once and then 409s for the rest of the day is worse than none.
 func triggerCouponBody() map[string]any {
 	return map[string]any{
-		"code":           "CLITRIGGER" + strings.ToUpper(randomSuffix()),
-		"discount_type":  "percent",
-		"discount_value": 10,
+		"code":        "CLITRIGGER" + strings.ToUpper(randomSuffix()),
+		"percent_off": 10,
 	}
 }
 
@@ -230,22 +231,25 @@ func triggerCmd(g *globals) *cobra.Command {
 		Use:   "trigger [event-type]",
 		Short: "Fire a test event by making the real API call that emits it",
 		Long: "Create real test-mode resources so BillKit emits the corresponding event\n" +
-			"(which `billkit listen` then forwards to your app). Run without an argument\n" +
-			"to list the supported event types.",
+			"(which `billkit listen` then forwards to your app), and print the final\n" +
+			"API response.\n\n" +
+			"Run without an argument to list the supported event types, one per line\n" +
+			"on stdout, or as a JSON array of objects with --json.",
 		Args: cobra.MaximumNArgs(1),
+		ValidArgsFunction: func(_ *cobra.Command, args []string, _ string) ([]string, cobra.ShellCompDirective) {
+			if len(args) > 0 {
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
+			return sortedTriggerNames(), cobra.ShellCompDirectiveNoFileComp
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
-				out := cmd.OutOrStdout()
-				fmt.Fprintln(out, "Supported trigger events:")
-				for _, name := range sortedTriggerNames() {
-					fmt.Fprintln(out, "  "+name)
-				}
-				return nil
+				return printTriggerList(cmd, g)
 			}
 
 			fn, ok := triggers[args[0]]
 			if !ok {
-				return fmt.Errorf("unsupported trigger %q — run `billkit trigger` to list supported events", args[0])
+				return usageErrorf("unsupported trigger %q; run `billkit trigger` to list the supported events", args[0])
 			}
 
 			c, err := client(cmd, g)
@@ -253,7 +257,7 @@ func triggerCmd(g *globals) *cobra.Command {
 				return err
 			}
 			if config.Mode(c.APIKey) == "live" {
-				return fmt.Errorf("refusing to trigger against a live key — trigger is test-mode only")
+				return errors.New("refusing to trigger against a live key: trigger is test-mode only")
 			}
 
 			ctx, cancel := context.WithTimeout(cmd.Context(), 30*time.Second)
@@ -263,11 +267,36 @@ func triggerCmd(g *globals) *cobra.Command {
 				return err
 			}
 
-			fmt.Fprintf(cmd.ErrOrStderr(), "Triggered %s\n", args[0])
+			fmt.Fprintf(g.notices(cmd.ErrOrStderr()), "Triggered %s\n", args[0])
 			fprintJSON(cmd.OutOrStdout(), g.color, out)
 			return nil
 		},
 	}
+}
+
+// printTriggerList is `billkit trigger` with no argument: the supported
+// event types on stdout, which is this form's data, one per line, or under
+// --json an array of {"type": ...} objects (objects rather than bare strings,
+// so a field can be added later without breaking anyone's parser).
+func printTriggerList(cmd *cobra.Command, g *globals) error {
+	names := sortedTriggerNames()
+	if g.json {
+		items := make([]map[string]string, 0, len(names))
+		for _, name := range names {
+			items = append(items, map[string]string{"type": name})
+		}
+		raw, err := json.Marshal(items)
+		if err != nil {
+			return err
+		}
+		fprintJSON(cmd.OutOrStdout(), g.color, raw)
+		return nil
+	}
+	fmt.Fprintln(cmd.ErrOrStderr(), "Supported trigger events:")
+	for _, name := range names {
+		fmt.Fprintln(cmd.OutOrStdout(), name)
+	}
+	return nil
 }
 
 func sortedTriggerNames() []string {

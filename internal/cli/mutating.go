@@ -26,8 +26,12 @@ type mutatingCall struct {
 	// loud banner and, in live mode, an explicit confirmation.
 	moves bool
 	// what describes the effect in one clause, e.g.
-	// `refund 500 cents of pay_123`. Used in the banner and the warnings.
+	// `refund EUR 5.00 of pay_123`. Used in the banner and the warnings.
 	what string
+	// describe, when set, refines what once a client exists, for a
+	// description that needs a read first (a refund's currency). It must not
+	// fail: whatever it cannot learn, it leaves out.
+	describe func(ctx context.Context, c *api.Client) string
 	// checkCmd is the command that shows whether the call already happened,
 	// printed before a retry is suggested.
 	checkCmd string
@@ -48,6 +52,9 @@ func runMutating(cmd *cobra.Command, g *globals, call mutatingCall) ([]byte, err
 		return nil, err
 	}
 	errw := cmd.ErrOrStderr()
+	if call.describe != nil {
+		call.what = call.describe(cmd.Context(), c)
+	}
 
 	key := call.idemKey
 	generated := false
@@ -58,8 +65,11 @@ func runMutating(cmd *cobra.Command, g *globals, call mutatingCall) ([]byte, err
 		generated = true
 	}
 
-	announceMode(errw, cr, call, g.color)
-	announceKey(errw, key, generated)
+	announceMode(errw, g.notices(errw), cr, call, g.color)
+	// Under --json the key line is a notice like any other. It is not lost
+	// where it matters: warnAmbiguous repeats it whenever the outcome is
+	// unknown, which is the one case a retry needs it for.
+	announceKey(g.notices(errw), key, generated)
 	if err := confirmLive(cmd, g, cr, call); err != nil {
 		return nil, err
 	}
@@ -79,7 +89,7 @@ func runMutating(cmd *cobra.Command, g *globals, call mutatingCall) ([]byte, err
 // ambiguousOutcome reports whether this failure leaves it genuinely unknown
 // whether the server did the work. Those are the only ones worth the
 // "may already exist, here is the safe re-run" guidance; printing it after a
-// 422 would teach people to ignore it.
+// 400 would teach people to ignore it.
 //
 // Three cases qualify, and the client has already retried each of them with
 // this same key:
@@ -105,10 +115,11 @@ func ambiguousOutcome(err error) bool {
 	return apiErr.StatusCode == http.StatusConflict && apiErr.Code == api.CodeIdempotencyInProgress
 }
 
-// announceMode states which credentials are about to be used. In live mode on
-// a money command it is a banner rather than a line, because "the CLI said
+// announceMode states which credentials are about to be used: a notice line
+// on note, except in live mode on a money command, where it is a banner on w
+// (stderr, even under --json) rather than a line, because "the CLI said
 // test mode and then spent real money" is the failure this prevents.
-func announceMode(w io.Writer, cr creds, call mutatingCall, colorMode string) {
+func announceMode(w, note io.Writer, cr creds, call mutatingCall, colorMode string) {
 	mode := cr.mode
 	if mode == "" {
 		mode = "unknown-mode"
@@ -130,12 +141,12 @@ func announceMode(w io.Writer, cr creds, call mutatingCall, colorMode string) {
 			return "\x1b[1;97;41m" + s + ansiReset
 		}
 		fmt.Fprintln(w)
-		fmt.Fprintln(w, alert("  LIVE MODE — THIS MOVES REAL MONEY  "))
+		fmt.Fprintln(w, alert("  LIVE MODE: THIS MOVES REAL MONEY  "))
 		fmt.Fprintf(w, "  Using %s\n", where)
 		fmt.Fprintf(w, "  About to %s\n\n", call.what)
 		return
 	}
-	fmt.Fprintf(w, "> %s mode (%s): %s\n", mode, where, call.what)
+	fmt.Fprintf(note, "> %s mode (%s): %s\n", mode, where, call.what)
 }
 
 // announceKey prints the key before the call, not after. An auto-generated
@@ -159,12 +170,14 @@ func confirmLive(cmd *cobra.Command, g *globals, cr creds, call mutatingCall) er
 	errw := cmd.ErrOrStderr()
 
 	if !interactive(cmd) {
-		return fmt.Errorf("live mode needs confirmation and stdin is not a terminal — re-run with --yes to authorise this %s", call.what)
+		// A bad invocation for a script, not a failed call: nothing was
+		// sent, and the fix is a flag.
+		return usageErrorf("live mode needs confirmation and stdin is not a terminal; re-run with --yes to authorise this %s", call.what)
 	}
 	fmt.Fprint(errw, "Proceed? [y/N]: ")
 	answer, err := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
 	if err != nil && answer == "" {
-		return fmt.Errorf("could not read a confirmation — re-run with --yes to authorise this %s", call.what)
+		return fmt.Errorf("could not read a confirmation; re-run with --yes to authorise this %s", call.what)
 	}
 	switch strings.ToLower(strings.TrimSpace(answer)) {
 	case "y", "yes":
@@ -210,7 +223,7 @@ func warnAmbiguous(w io.Writer, call mutatingCall, key string) {
 // ever prints the secret: creds.origin() names the source and the live-mode
 // banner shows that name. Reproducing argv verbatim would have made the
 // "something went wrong, here is how to retry" path the only one that leaks
-// it — the worst possible moment, because it is the line the user copies.
+// it, at the worst possible moment, because it is the line the user copies.
 func retryCommand(key string) string {
 	args := make([]string, 0, len(os.Args)+2)
 	if len(os.Args) > 0 {

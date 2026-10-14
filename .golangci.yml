@@ -27,7 +27,7 @@ linters:
   settings:
     errcheck:
       # Terminal output writes to os.Stdout/Stderr can only fail on a broken
-      # pipe, which a CLI can't act on — checking every print is noise, not
+      # pipe, which a CLI can't act on; checking every print is noise, not
       # safety. (Close() and hasher writes are handled explicitly at the call
       # site.)
       exclude-functions:

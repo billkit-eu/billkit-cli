@@ -74,8 +74,8 @@ func TestDoMapsNonSuccessToAPIError(t *testing.T) {
 
 func TestDoParsesErrorEnvelopeFields(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusUnprocessableEntity)
-		_, _ = w.Write([]byte(`{"error":{"type":"invalid_request_error","code":"parameter_invalid",` +
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"type":"invalid_request_error","code":"parameter_missing",` +
 			`"message":"Missing required parameter.","param":"amount_cents","reason":"no_active_mandate"}}`))
 	}))
 	defer srv.Close()
@@ -86,11 +86,11 @@ func TestDoParsesErrorEnvelopeFields(t *testing.T) {
 	if !errors.As(err, &apiErr) {
 		t.Fatalf("error type = %T", err)
 	}
-	if apiErr.Code != "parameter_invalid" || apiErr.Param != "amount_cents" || apiErr.Reason != "no_active_mandate" {
+	if apiErr.Code != "parameter_missing" || apiErr.Param != "amount_cents" || apiErr.Reason != "no_active_mandate" {
 		t.Fatalf("parsed fields = %+v", apiErr)
 	}
 	msg := apiErr.Error()
-	for _, want := range []string{"parameter_invalid", "HTTP 422", "Missing required parameter", "reason: no_active_mandate", "param: amount_cents"} {
+	for _, want := range []string{"parameter_missing", "HTTP 400", "Missing required parameter", "reason: no_active_mandate", "param: amount_cents"} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("Error() = %q, missing %q", msg, want)
 		}
@@ -181,7 +181,7 @@ func TestRetryReusesTheSameIdempotencyKey(t *testing.T) {
 		t.Fatal("the first attempt went out with no Idempotency-Key")
 	}
 	if keys[0] != keys[1] {
-		t.Fatalf("retry used a different key: %q then %q — that is a second real charge", keys[0], keys[1])
+		t.Fatalf("retry used a different key: %q then %q: that is a second real charge", keys[0], keys[1])
 	}
 }
 
@@ -206,7 +206,7 @@ func TestNoRetryOnClientError(t *testing.T) {
 	var hits int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		atomic.AddInt64(&hits, 1)
-		w.WriteHeader(http.StatusUnprocessableEntity)
+		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(`{"error":{"message":"bad amount"}}`))
 	}))
 	defer srv.Close()
@@ -216,7 +216,7 @@ func TestNoRetryOnClientError(t *testing.T) {
 		t.Fatal("expected an error")
 	}
 	if got := atomic.LoadInt64(&hits); got != 1 {
-		t.Fatalf("attempts = %d, want 1 — a 4xx is the caller's fault and never improves on retry", got)
+		t.Fatalf("attempts = %d, want 1: a 4xx is the caller's fault and never improves on retry", got)
 	}
 }
 
@@ -442,5 +442,104 @@ func TestRetriesABodyThatDiesMidRead(t *testing.T) {
 	}
 	if got := atomic.LoadInt64(&hits); got != 2 {
 		t.Fatalf("attempts = %d, want 2", got)
+	}
+}
+
+// TestDoRefusesRedirectsWhateverClientItIsGiven. Every request this package
+// makes carries the API key, so a redirect to plain http on another host:port
+// is refused. New enforces the policy itself, so a caller that hands in a
+// default client is covered as well.
+func TestDoRefusesRedirectsWhateverClientItIsGiven(t *testing.T) {
+	var followed atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		followed.Add(1)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer target.Close()
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.Redirect(w, r, target.URL+"/v1/refunds", http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+
+	for name, hc := range map[string]*http.Client{"nil": nil, "default": http.DefaultClient, "caller's": srv.Client()} {
+		t.Run(name, func(t *testing.T) {
+			hits.Store(0)
+			c := New(srv.URL, "bk_live_x", "1.0", hc)
+			_, err := c.Do(context.Background(), http.MethodPost, "/v1/refunds/", map[string]any{"amount": 1})
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusTemporaryRedirect {
+				t.Fatalf("want an APIError carrying the 307, got %v", err)
+			}
+			if !strings.Contains(apiErr.Error(), target.URL) {
+				t.Errorf("the error should name where the redirect pointed, got %q", apiErr.Error())
+			}
+			if n := hits.Load(); n != 1 {
+				t.Errorf("a refused redirect was retried: %d attempts", n)
+			}
+		})
+	}
+	if n := followed.Load(); n != 0 {
+		t.Fatalf("the redirect was followed %d time(s), carrying the key with it", n)
+	}
+	if http.DefaultClient.CheckRedirect != nil {
+		t.Fatal("New must not modify the client it was handed")
+	}
+}
+
+// TestDoFollowsACrossHostHTTPSRedirectWithoutTheKey is the invoice PDF shape:
+// under S3 storage the API answers 302 with a presigned URL on the storage
+// host. It has to be followed, and the storage host must never see the key.
+// The two TLS servers share a hostname and differ only in port, which
+// net/http's own header stripping treats as the same host and would forward
+// Authorization to; the policy compares host:port.
+func TestDoFollowsACrossHostHTTPSRedirectWithoutTheKey(t *testing.T) {
+	var storageAuth atomic.Value
+	storageAuth.Store("unset")
+	storage := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		storageAuth.Store(r.Header.Get("Authorization"))
+		_, _ = w.Write([]byte("%PDF-1.7"))
+	}))
+	defer storage.Close()
+	var apiAuth atomic.Value
+	api := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiAuth.Store(r.Header.Get("Authorization"))
+		http.Redirect(w, r, storage.URL+"/bucket/in_1.pdf?X-Amz-Signature=abc", http.StatusFound)
+	}))
+	defer api.Close()
+
+	c := New(api.URL, "bk_live_SECRET", "1.0", api.Client())
+	out, err := c.Do(context.Background(), http.MethodGet, "/v1/invoices/in_1/pdf", nil)
+	if err != nil {
+		t.Fatalf("a cross-host https redirect should be followed, got %v", err)
+	}
+	if string(out) != "%PDF-1.7" {
+		t.Errorf("body = %q", out)
+	}
+	if got := apiAuth.Load(); got != "Bearer bk_live_SECRET" {
+		t.Errorf("the API host should get the key, got %q", got)
+	}
+	if got := storageAuth.Load(); got != "" {
+		t.Fatalf("the storage host received Authorization %q: the key followed the redirect off the API host", got)
+	}
+}
+
+// TestFollowSafeRedirectsRefusesADowngrade checks the policy directly for the
+// one shape the CLI-level tests drive end to end: https to plain http on the
+// same host, which net/http would follow with Authorization attached.
+func TestFollowSafeRedirectsRefusesADowngrade(t *testing.T) {
+	first, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://127.0.0.1:8443/v1/invoices/in_1/pdf", nil)
+	next, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://127.0.0.1:8443/v1/invoices/in_1/pdf", nil)
+	if err := FollowSafeRedirects(next, []*http.Request{first}); !errors.Is(err, http.ErrUseLastResponse) {
+		t.Fatalf("an https to http redirect must be refused, got %v", err)
+	}
+	same, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://127.0.0.1:8443/v1/other", nil)
+	same.Header.Set("Authorization", "Bearer k")
+	if err := FollowSafeRedirects(same, []*http.Request{first}); err != nil {
+		t.Fatalf("a same-origin https redirect should be followed, got %v", err)
+	}
+	if same.Header.Get("Authorization") == "" {
+		t.Error("a same-origin redirect should keep Authorization")
 	}
 }

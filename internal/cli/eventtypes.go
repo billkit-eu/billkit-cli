@@ -82,7 +82,7 @@ var knownEventTypes = map[string]struct{}{
 //
 // Returns them sorted so the message is stable, and does NOT accept the "*"
 // wildcard: omitting --events already means "every event", and the stream
-// endpoint rejects the wildcard for the same reason — an all-events filter
+// endpoint rejects the wildcard for the same reason: an all-events filter
 // that spells two ways is one a reader has to be taught.
 //
 // An empty or whitespace-only entry is skipped rather than reported: a

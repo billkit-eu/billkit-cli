@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -24,7 +23,7 @@ func TestColorizeJSONAlwaysValid(t *testing.T) {
 		`"top-level"`,
 		`{"tab":"a\tb\nc"}`,
 		// Control chars (NUL, DEL) arrive as \u escapes and are decoded to
-		// real runes by json.Decoder — the case the strconv.Quote bug broke.
+		// real runes by json.Decoder, the case the strconv.Quote bug broke.
 		"{\"ctrl\":\"a\\u0000b\\u007fc\"}",
 		`{"unicode":"héllo 🎉","html":"<a>&</a>"}`,
 		`{"nested":{"a":[1,2,{"b":null}],"c":{}},"n":-9007199254740991}`,
@@ -131,7 +130,7 @@ func TestParseMetadata(t *testing.T) {
 // This is what the fprintJSON(w, ...) shape buys: before it, every command
 // wrote straight to os.Stdout, so a test (or any caller embedding the command
 // tree) could redirect the command and still see nothing. The assertion is on
-// the plumbing, not on the API — hence the stubbed transport.
+// the plumbing, not on the API, hence the stubbed transport.
 func TestCommandJSONGoesToTheCobraWriter(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -172,27 +171,32 @@ func TestPlainTextOutputGoesToTheCobraWriter(t *testing.T) {
 	g := &globals{color: "never"}
 
 	for _, tc := range []struct {
-		name string
-		cmd  func() *cobra.Command
-		args []string
-		want string
+		name     string
+		cmd      func() *cobra.Command
+		args     []string
+		want     string
+		toStderr bool // a notice, not data, so it belongs on the error writer
 	}{
-		{"config path", func() *cobra.Command { return configCmd(g) }, []string{"path"}, "config.json"},
-		{"config list", func() *cobra.Command { return configCmd(g) }, []string{"list"}, "No profiles configured"},
-		{"trigger", func() *cobra.Command { return triggerCmd(g) }, nil, "customer.created"},
+		{"config path", func() *cobra.Command { return configCmd(g) }, []string{"path"}, "config.json", false},
+		{"config list", func() *cobra.Command { return configCmd(g) }, []string{"list"}, "No profiles configured", true},
+		{"trigger", func() *cobra.Command { return triggerCmd(g) }, nil, "customer.created", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cmd := tc.cmd()
-			var out bytes.Buffer
+			var out, errOut bytes.Buffer
 			cmd.SetOut(&out)
-			cmd.SetErr(io.Discard)
+			cmd.SetErr(&errOut)
 			cmd.SetArgs(tc.args)
 			if err := cmd.Execute(); err != nil {
 				t.Fatalf("%s: %v", tc.name, err)
 			}
-			if !strings.Contains(out.String(), tc.want) {
+			got := out.String()
+			if tc.toStderr {
+				got = errOut.String()
+			}
+			if !strings.Contains(got, tc.want) {
 				t.Fatalf("%s wrote nothing containing %q to the command's own writer, got %q",
-					tc.name, tc.want, out.String())
+					tc.name, tc.want, got)
 			}
 		})
 	}

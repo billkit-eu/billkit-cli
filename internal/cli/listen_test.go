@@ -175,7 +175,7 @@ func (c *cursorLog) record(r *http.Request) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.cursors = append(c.cursors, r.URL.Query().Get("starting_after"))
-	c.types = append(c.types, r.URL.Query().Get("types"))
+	c.types = append(c.types, r.URL.Query().Get("type"))
 }
 
 func (c *cursorLog) seen() ([]string, []string) {
@@ -357,6 +357,30 @@ func TestListenThatNeverConnectedReportsWhy(t *testing.T) {
 	}
 }
 
+// TestListenStoppedBeforeTheFirstAnswerIsNotSuccess: Ctrl-C (or a CI
+// timeout's SIGTERM) while the very first attempt is still waiting for the
+// server used to exit 0, because no attempt had failed yet to supply an
+// error. Never having reached the stream is a failure however it ends.
+func TestListenStoppedBeforeTheFirstAnswerIsNotSuccess(t *testing.T) {
+	hang := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer hang.Close()
+
+	l := testListener(hang.URL, newTarget(t).forwarder(), &syncBuf{})
+	l.stallTimeout = time.Hour
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	err := l.run(ctx)
+	if err == nil {
+		t.Fatal("stopped before the stream ever answered, and still reported success")
+	}
+	if got := ExitCode(err); got != ExitFailure {
+		t.Fatalf("ExitCode = %d, want %d", got, ExitFailure)
+	}
+}
+
 // TestListenRetriesTransientFailures is the other half of the same rule: a
 // 503 really is "try again", and the stream must recover from it.
 func TestListenRetriesTransientFailures(t *testing.T) {
@@ -429,7 +453,6 @@ func TestStreamStatusErrorClassification(t *testing.T) {
 		{"forbidden names the scope", 403, true, "events:read"},
 		{"not found names the host", 404, true, "--base-url"},
 		{"request timeout is temporary", 408, false, ""},
-		{"unprocessable names the filter", 422, true, "--events"},
 		{"rate limited is temporary", 429, false, ""},
 		{"server error is temporary", 500, false, ""},
 		{"bad gateway is temporary", 502, false, ""},
@@ -681,10 +704,80 @@ func TestListenResumesFromTheLastEventItForwarded(t *testing.T) {
 	}
 }
 
+// TestListenSkipsAnEventAResumeSendsAgain covers the server's half of a safe
+// cursor: a resume also sends the events of a transaction that was still
+// committing when the cursor event was written, though they order before it.
+// When the cursor came from the stream those were usually forwarded already,
+// and the local endpoint must not see them twice, nor the cursor move back.
+func TestListenSkipsAnEventAResumeSendsAgain(t *testing.T) {
+	tg := newTarget(t)
+	log := &cursorLog{}
+	srv := newSSEServer(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			log.record(r)
+			openSSE(w)
+			sendFrame(w, "message", eventJSON("evt_0", "customer.created", 100))
+			sendFrame(w, "message", eventJSON("evt_1", "customer.updated", 101))
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			log.record(r)
+			openSSE(w)
+			sendFrame(w, "message", eventJSON("evt_0", "customer.created", 100))
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			log.record(r)
+			openSSE(w)
+			sendFrame(w, "message", eventJSON("evt_2", "invoice.paid", 102))
+			<-r.Context().Done()
+		},
+	)
+
+	errOut := &syncBuf{}
+	l := testListener(srv.URL, tg.forwarder(), errOut)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- l.run(ctx) }()
+
+	waitFor(t, "the reconnected stream to deliver evt_2", func() bool {
+		return slices.Contains(tg.got(), "evt_2")
+	})
+	cancel()
+	<-done
+
+	if got, want := tg.got(), []string{"evt_0", "evt_1", "evt_2"}; !slices.Equal(got, want) {
+		t.Fatalf("a re-sent event must not be forwarded twice: got %v, want %v", got, want)
+	}
+	cursors, _ := log.seen()
+	if len(cursors) < 3 || cursors[1] != "evt_1" || cursors[2] != "evt_1" {
+		t.Errorf("the skipped event must not move the cursor back: got cursors %v", cursors)
+	}
+	if !strings.Contains(errOut.String(), "evt_0 was sent again") {
+		t.Errorf("the skip must be reported, got %q", errOut.String())
+	}
+}
+
+func TestRecentIDsForgetsTheOldestPastItsCap(t *testing.T) {
+	var r recentIDs
+	for i := range recentIDsCap + 1 {
+		r.add(fmt.Sprintf("evt_%d", i))
+	}
+	if r.has("evt_0") {
+		t.Error("evt_0 is past the cap and must have been forgotten")
+	}
+	if !r.has("evt_1") || !r.has(fmt.Sprintf("evt_%d", recentIDsCap)) {
+		t.Error("the latest ids must still be remembered")
+	}
+	if len(r.ids) != recentIDsCap {
+		t.Errorf("len = %d, want %d", len(r.ids), recentIDsCap)
+	}
+}
+
 // TestListenSendsTheEventsFilterWithTheCursor is the regression test for the
 // bug the server-side cursor closed. The replay used to be a client-side walk
 // of GET /v1/events, which has no multi-type filter, so every reconnect under
-// `--events` forwarded event types the user had explicitly excluded — and the
+// `--events` forwarded event types the user had explicitly excluded, and the
 // server's idle ceiling makes a reconnect happen roughly hourly.
 func TestListenSendsTheEventsFilterWithTheCursor(t *testing.T) {
 	const filter = "customer.created,invoice.paid"
@@ -819,10 +912,10 @@ func TestStaleCursorOnlyMatchesTheCursorParameter(t *testing.T) {
 	}
 	badFilter := &streamStatusError{
 		status: http.StatusBadRequest,
-		body:   `{"error":{"code":"parameter_invalid","message":"Unknown event types: nope","param":"types"}}`,
+		body:   `{"error":{"code":"parameter_invalid","message":"Unknown event type(s): nope","param":"type"}}`,
 	}
 	if badFilter.staleCursor() {
-		t.Error("a 400 about the types filter must stay fatal")
+		t.Error("a 400 about the type filter must stay fatal")
 	}
 	if (&streamStatusError{status: http.StatusBadRequest}).staleCursor() {
 		t.Error("a 400 with no envelope says nothing about the cursor")
@@ -1010,15 +1103,22 @@ func TestListenReportsAndStepsPastAnOversizedEvent(t *testing.T) {
 	})
 
 	errOut := &syncBuf{}
-	l := testListener(srv.URL, tg.forwarder(), errOut)
+	fwd := tg.forwarder()
+	// Wait for the forwarder's own delivery line, not for the receiver to
+	// have the request: the receiver records it before the response reaches
+	// listen, and a forward cancelled in that window rightly leaves the
+	// cursor where it was.
+	delivered := &syncBuf{}
+	fwd.logOut = delivered
+	l := testListener(srv.URL, fwd, errOut)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- l.run(ctx) }()
 
-	waitFor(t, "the event after the oversized one", func() bool {
-		return slices.Contains(tg.got(), "evt_small")
+	waitFor(t, "the event after the oversized one to be delivered", func() bool {
+		return strings.Contains(delivered.String(), "evt_small  -> 200")
 	})
 	cancel()
 	<-done
@@ -1241,5 +1341,187 @@ func TestConsumeSSEDefaultsToTheMessageEventType(t *testing.T) {
 	}
 	if seen[0].event != "message" {
 		t.Fatalf("event = %q, want %q", seen[0].event, "message")
+	}
+}
+
+// --- a slow local handler ----------------------------------------------------
+
+// keepAlive writes the server's ":" comment every step until the client
+// goes away, which is what a healthy, quiet stream looks like on the wire.
+func keepAlive(w http.ResponseWriter, r *http.Request, step time.Duration) {
+	tick := time.NewTicker(step)
+	defer tick.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-tick.C:
+			if _, err := fmt.Fprint(w, ":\n\n"); err != nil {
+				return
+			}
+			w.(http.Flusher).Flush()
+		}
+	}
+}
+
+// TestListenKeepsTheStreamThroughASlowLocalHandler. The stream is not read
+// while an event is being forwarded, so a local handler slower than the
+// stall timeout looked to the watchdog exactly like a dead socket. It
+// cancelled the attempt under the forward, the forward returned without
+// saying the event was lost, and deliver moved the cursor past it anyway:
+// the one event the developer was debugging was neither delivered nor
+// reported. The watchdog is now held for the length of a forward.
+func TestListenKeepsTheStreamThroughASlowLocalHandler(t *testing.T) {
+	var hits atomic.Int64
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		// Well past the 150ms stall timeout testListener uses.
+		time.Sleep(600 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slow.Close()
+
+	srv := newSSEServer(t, func(w http.ResponseWriter, r *http.Request) {
+		openSSE(w)
+		sendFrame(w, "message", eventJSON("evt_slow", "customer.created", 100))
+		keepAlive(w, r, 20*time.Millisecond)
+	})
+
+	errOut := &syncBuf{}
+	logOut := &syncBuf{}
+	fwd := &forwarder{
+		url: slow.URL, secret: "bkwhsec_unit_test", client: slow.Client(),
+		out: io.Discard, logOut: logOut,
+		backoff: []time.Duration{time.Millisecond, time.Millisecond},
+	}
+	l := testListener(srv.URL, fwd, errOut)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- l.run(ctx) }()
+
+	waitFor(t, "the slow handler to answer", func() bool {
+		return strings.Contains(logOut.String(), "-> 200")
+	})
+	// Several stall windows more, with keep-alives flowing, to prove the
+	// stream stayed up after the forward too.
+	time.Sleep(450 * time.Millisecond)
+	cancel()
+	<-done
+
+	if n := hits.Load(); n != 1 {
+		t.Errorf("the handler received the event %d times, want 1", n)
+	}
+	if n := srv.connections(); n != 1 {
+		t.Errorf("connections = %d, want 1: a slow handler must not be read as a dead stream\nstderr: %s\nlog: %s",
+			n, errOut.String(), logOut.String())
+	}
+	if strings.Contains(errOut.String(), errStreamStalled.Error()) {
+		t.Errorf("the stream was reported stalled while a forward was in flight: %q", errOut.String())
+	}
+	if l.resumeAfter != "evt_slow" {
+		t.Errorf("resumeAfter = %q, want evt_slow once it was delivered", l.resumeAfter)
+	}
+}
+
+// TestForwardDoesNotRetryATimeoutAfterTheRequestWasSent. A client timeout
+// after the request went out means the app has the event and has not
+// answered yet. Retrying it handed a slow handler the same event four times.
+func TestForwardDoesNotRetryATimeoutAfterTheRequestWasSent(t *testing.T) {
+	var hits atomic.Int64
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case <-time.After(2 * time.Second):
+		case <-r.Context().Done():
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slow.Close()
+
+	var log strings.Builder
+	fwd := &forwarder{
+		url: slow.URL, secret: "bkwhsec_unit_test",
+		client: &http.Client{Timeout: 50 * time.Millisecond},
+		out:    io.Discard, logOut: &log,
+		backoff: []time.Duration{time.Millisecond, time.Millisecond},
+	}
+	finished := fwd.handle(context.Background(), []byte(`{"id":"evt_1","type":"customer.created"}`))
+
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("delivery attempts = %d, want 1: the app already had the event\nlog: %s", n, log.String())
+	}
+	if !finished {
+		t.Error("an unconfirmed delivery that was reported counts as finished")
+	}
+	out := log.String()
+	if !strings.Contains(out, "NOT retried") || !strings.Contains(out, "billkit events retrieve evt_1") {
+		t.Errorf("the unconfirmed delivery must be named with the command that reads it: %q", out)
+	}
+}
+
+// TestListenReportsAForwardCutShortAndKeepsTheCursor. When the attempt ends
+// under a forward (Ctrl-C, or the attempt being cancelled), the event is
+// named as NOT forwarded with the command that reads it back, and the cursor
+// stays where it was, so a reconnect replays it instead of skipping it.
+func TestListenReportsAForwardCutShortAndKeepsTheCursor(t *testing.T) {
+	stuck := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Read the body first: net/http only notices the client leaving
+		// once the request has been consumed.
+		_, _ = io.Copy(io.Discard, r.Body)
+		<-r.Context().Done()
+	}))
+	defer stuck.Close()
+
+	logOut := &syncBuf{}
+	fwd := &forwarder{
+		url: stuck.URL, secret: "bkwhsec_unit_test", client: stuck.Client(),
+		out: io.Discard, logOut: logOut,
+	}
+	l := testListener("https://api.example.test", fwd, &syncBuf{})
+	l.resumeAfter = "evt_prev"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	l.deliver(ctx, []byte(eventJSON("evt_cut", "customer.created", 100)))
+
+	out := logOut.String()
+	if !strings.Contains(out, "NOT forwarded") || !strings.Contains(out, "billkit events retrieve evt_cut") {
+		t.Errorf("an abandoned forward must be reported with its recovery command: %q", out)
+	}
+	if l.resumeAfter != "evt_prev" {
+		t.Errorf("resumeAfter = %q, want evt_prev: the cursor moved past an event that was not delivered", l.resumeAfter)
+	}
+}
+
+// TestListenEndsOnTheServersUnauthorizedFrame. A key revoked mid-stream gets
+// an `unauthorized` frame and a closed connection. It used to be ignored, so
+// the listener reconnected into a bare 401 and the server's explanation was
+// never shown. It is now fatal, carries the server's message, and exits 4.
+func TestListenEndsOnTheServersUnauthorizedFrame(t *testing.T) {
+	const msg = "This credential is no longer valid. The stream has ended."
+	srv := newSSEServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		openSSE(w)
+		sendFrame(w, "unauthorized", `{"message":"`+msg+`"}`)
+	})
+
+	errOut := &syncBuf{}
+	l := testListener(srv.URL, newTarget(t).forwarder(), errOut)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	err := l.run(ctx)
+	if err == nil {
+		t.Fatal("a revoked key must end listen with an error")
+	}
+	if !strings.Contains(err.Error(), msg) {
+		t.Errorf("the server's message must be shown, got %v", err)
+	}
+	if got := ExitCode(err); got != ExitAuth {
+		t.Errorf("ExitCode = %d, want %d", got, ExitAuth)
+	}
+	if n := srv.connections(); n != 1 {
+		t.Errorf("connections = %d, want 1: a revoked key is not retried", n)
 	}
 }

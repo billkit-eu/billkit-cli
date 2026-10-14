@@ -134,7 +134,7 @@ func colorizeJSON(out io.Writer, raw []byte, color bool) error {
 				stack = append(stack, &frame{isObject: t == '{'})
 			case '}', ']':
 				if len(stack) == 0 {
-					// Unbalanced close — can't happen for the valid JSON that
+					// Unbalanced close. It can't happen for the valid JSON that
 					// fprintJSON gates on, but never index into an empty stack.
 					return fmt.Errorf("unbalanced JSON delimiter")
 				}
@@ -181,7 +181,7 @@ func renderScalar(tok any, paint func(code, s string) string, isKey bool) string
 	}
 }
 
-// jsonQuote renders a string as a valid JSON string literal — control
+// jsonQuote renders a string as a valid JSON string literal, with control
 // characters escaped the JSON way (unlike strconv.Quote, which emits Go
 // syntax like \x00 that isn't valid JSON). HTML escaping is disabled so
 // <, >, & display literally in the terminal.

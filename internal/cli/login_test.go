@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/billkit-eu/billkit-cli/internal/config"
@@ -59,13 +61,15 @@ func TestLoginAcceptsAKeyRefusedForScope(t *testing.T) {
 	}
 
 	// Saved, not merely tolerated: the bug was that the profile never landed.
+	// A live key lands in the (fake) keychain, so read it back the way every
+	// command does rather than out of the struct.
 	cfg, err := config.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, ok := cfg.Profiles["live"]
-	if !ok || p.APIKey != "bk_live_SCOPED" {
-		t.Fatalf("login did not store the profile: %+v", cfg.Profiles)
+	p, _, err := cfg.Resolve("live")
+	if err != nil || p.APIKey != "bk_live_SCOPED" {
+		t.Fatalf("login did not store the profile: %+v (%v)", cfg.Profiles, err)
 	}
 }
 
@@ -180,5 +184,67 @@ func TestLoginRefusesToMislabelTheMode(t *testing.T) {
 	if _, err := runCLI(t, "login", "--profile", "live",
 		"--api-key", "bk_live_DANGER01", "--base-url", srv.URL); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestLoginAnnouncesANonDefaultHost. Every other command says when it is
+// pointed somewhere other than the official API; login, the one that sends a
+// fresh key to an untried host, used to say nothing.
+func TestLoginAnnouncesANonDefaultHost(t *testing.T) {
+	t.Setenv("BILLKIT_CONFIG_HOME", t.TempDir())
+	t.Setenv("BILLKIT_API_KEY", "")
+	rec := &recorder{}
+	srv := tlsStub(t, rec.handler())
+	t.Setenv("BILLKIT_BASE_URL", srv.URL)
+
+	stderr, err := runCLI(t, "login", "--api-key", "bk_live_SECRET")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr, "> Using API host "+srv.URL) {
+		t.Fatalf("login must name the non-default host it sends the key to; stderr = %q", stderr)
+	}
+	if strings.Contains(stderr, "bk_live_SECRET") {
+		t.Fatalf("the notice must not print the key; stderr = %q", stderr)
+	}
+}
+
+// TestConcurrentLoginsLeaveOneKeychainEntry: two `billkit login` runs at
+// once each stored the live key under a fresh keychain account and wrote a
+// file naming their own, so every account but the last writer's was left in
+// the keychain with nothing referring to it. Login now reads, stores and
+// writes under the config lock.
+func TestConcurrentLoginsLeaveOneKeychainEntry(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("BILLKIT_CONFIG_HOME", dir)
+	t.Setenv("BILLKIT_API_KEY", "")
+	t.Setenv("BILLKIT_PROFILE", "")
+	kr := useFakeKeyring(t)
+	srv := tlsStub(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"object":"ping"}`))
+	}))
+
+	var wg sync.WaitGroup
+	errs := make([]error, 8)
+	for i := range errs {
+		wg.Go(func() {
+			_, errs[i] = runCLI(t, "login", "--api-key", fmt.Sprintf("bk_live_RACE%04d", i), "--base-url", srv.URL)
+		})
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("login %d: %v", i, err)
+		}
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kr.len() != 1 || cfg.Profiles["live"].Keychain == "" {
+		t.Fatalf("keychain items = %d, profile = %+v; want exactly one entry, referenced", kr.len(), cfg.Profiles["live"])
+	}
+	if _, err := kr.Get(config.KeyringService, cfg.Profiles["live"].Keychain); err != nil {
+		t.Fatalf("the surviving entry is not the one the file names: %v", err)
 	}
 }

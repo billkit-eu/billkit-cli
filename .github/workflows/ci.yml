@@ -4,6 +4,9 @@ name: CI
 # They run here too because this is the repository a contributor reads, the
 # repository the module proxy serves, and the repository a release is cut from:
 # a green tick has to mean something on its own.
+#
+# Actions are pinned to full commit SHAs, with the release in a comment, so a
+# moved upstream tag cannot change what runs here.
 on:
   push:
     branches: [main]
@@ -21,9 +24,9 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         go: ['1.26']
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ matrix.go }}
 
@@ -31,11 +34,27 @@ jobs:
         if: runner.os == 'Linux'
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
 
+      # GoReleaser no longer tidies on the release runner, so the committed
+      # go.mod/go.sum are what gets built; they have to be tidy already.
+      - name: go.mod is tidy
+        if: runner.os == 'Linux'
+        run: go mod tidy -diff
+
       - name: Lint
         if: runner.os == 'Linux'
-        uses: golangci/golangci-lint-action@v9
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.12.2
+
+      # Known vulnerabilities in the module graph that the binary actually
+      # calls. Pinned, like the actions, so the checker changes in a diff.
+      - name: govulncheck
+        if: runner.os == 'Linux'
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+      - name: Vet (integration-tagged package included)
+        if: runner.os == 'Linux'
+        run: go vet -tags integration ./...
 
       - name: Test
         run: go test -race ./...

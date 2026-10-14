@@ -49,9 +49,11 @@ func captureWarnings(t *testing.T) *bytes.Buffer {
 	prev := warnWriter
 	warnWriter = buf
 	warnOnce = sync.Once{}
+	bothExistOnce = sync.Once{}
 	t.Cleanup(func() {
 		warnWriter = prev
 		warnOnce = sync.Once{}
+		bothExistOnce = sync.Once{}
 	})
 	return buf
 }
@@ -173,8 +175,8 @@ func TestDelete(t *testing.T) {
 // key. The old Save() passes every other test in this file, because they all
 // start from an empty t.TempDir().
 // TestSaveTightensTheDefaultConfigDir covers the directory the CLI owns.
-// ~/.billkit is ours and nothing else lives in it, so a pre-existing 0755 one
-// is still tightened on save, because MkdirAll only applies its mode to directories
+// ~/.config/billkit is ours and nothing else lives in it, so a pre-existing
+// 0755 one is still tightened on save, because MkdirAll only applies its mode to directories
 // it actually creates, so without this a config dir that arrived from a
 // dotfiles checkout would stay world-listable forever.
 func TestSaveTightensTheDefaultConfigDir(t *testing.T) {
@@ -183,9 +185,10 @@ func TestSaveTightensTheDefaultConfigDir(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	// Unset, not redirected: this is the branch where Path() derives
-	// ~/.billkit itself.
+	// ~/.config/billkit itself.
 	t.Setenv("BILLKIT_CONFIG_HOME", "")
-	dir := filepath.Join(home, ".billkit")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	dir := filepath.Join(home, ".config", "billkit")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +208,7 @@ func TestSaveTightensTheDefaultConfigDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	if perm := info.Mode().Perm(); perm != 0o700 {
-		t.Errorf("~/.billkit perms = %04o, want 0700: this directory is the CLI's own", perm)
+		t.Errorf("~/.config/billkit perms = %04o, want 0700: this directory is the CLI's own", perm)
 	}
 	if warnings.Len() != 0 {
 		t.Errorf("the CLI fixed this one itself, so there is nothing to warn about: %q", warnings.String())
@@ -310,18 +313,19 @@ func TestSaveTightensPreexistingFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	if perm := fileInfo.Mode().Perm(); perm != 0o600 {
-		t.Errorf("config perms = %04o, want 0600 — a live key is readable by every other account on this machine", perm)
+		t.Errorf("config perms = %04o, want 0600: a live key is readable by every other account on this machine", perm)
 	}
 	// The directory is not touched here: it came from BILLKIT_CONFIG_HOME, so
 	// it is the user's. See TestSaveLeavesACustomConfigDirAlone.
 
-	// The atomic write must not leave its scratch file behind.
+	// The atomic write must not leave its scratch file behind. The lock file
+	// is meant to stay: deleting it would let two writers lock two inodes.
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, e := range entries {
-		if e.Name() != "config.json" {
+		if e.Name() != "config.json" && e.Name() != lockFileName {
 			t.Errorf("leftover file in the config dir: %q", e.Name())
 		}
 	}

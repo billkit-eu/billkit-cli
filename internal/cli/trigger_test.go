@@ -27,7 +27,7 @@ import (
 // The emit site for each entry below, all verified:
 //
 //	customer.created/.updated    services/customers.py
-//	customer.deleted             services/customers.py (purge, not delete)
+//	customer.deleted             services/customers.py (delete_customer)
 //	product.created              services/products.py
 //	product.updated/.archived    services/products.py (the `archiving` split)
 //	price.created                services/pricing.py

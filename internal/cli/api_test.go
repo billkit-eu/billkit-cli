@@ -83,6 +83,43 @@ func TestIsMoneyPath(t *testing.T) {
 	}
 }
 
+// TestIsMoneyPathSeesThroughSpelling. The gate used to match the literal
+// string, so a trailing slash, a percent-encoded letter or a dot segment sent
+// a live refund or cancel out with no banner, no prompt and no --yes check,
+// while the server routed it to exactly the endpoint the gate exists for.
+func TestIsMoneyPathSeesThroughSpelling(t *testing.T) {
+	for _, p := range []string{
+		"/v1/refunds/",
+		"/v1/subscriptions/sub_1/cancel/",
+		"/v1/%72efunds",
+		"/v1/%2572efunds",
+		"/v1/subscriptions/sub_1/%63ancel",
+		"/v1/REFUNDS",
+		"/v1/Subscriptions/sub_1/Update",
+		"//v1//refunds",
+		"/v1/customers/../refunds",
+		"/v1/./checkout/one_shot",
+		"/v1/subscriptions/sub_1/cancel#frag",
+		"/v1/refunds%2F",
+		// Undecodable: refused as money rather than waved through.
+		"/v1/%zzfunds",
+		"/v1/customers/%",
+	} {
+		if !isMoneyPath(p) {
+			t.Errorf("%s reaches a money route (or cannot be read) and must be confirmed in live mode", p)
+		}
+	}
+	for _, p := range []string{
+		"/v1/subscriptions/sub_1/pause/",
+		"/v1/%63ustomers",
+		"/v1/customers/",
+	} {
+		if isMoneyPath(p) {
+			t.Errorf("%s takes no payment and must not raise the money banner", p)
+		}
+	}
+}
+
 // TestAPIJSONBodySendsArraysAndNestedObjects is the gap --data could not
 // cover. `scopes` on an API key, `enabled_events` on a webhook endpoint and
 // `metadata` on almost everything are arrays and objects, and several of them
@@ -93,8 +130,8 @@ func TestAPIJSONBodySendsArraysAndNestedObjects(t *testing.T) {
 	srv := tlsStub(t, rec.handler())
 
 	const payload = `{"name":"ci","scopes":["events:read","refunds:write"],"metadata":{"team":"payments"}}`
-	if _, err := runCLI(t, "api", "POST", "/v1/api_keys",
-		"--json", payload,
+	if _, err := runCLIWithStdin(t, strings.NewReader(payload), "api", "POST", "/v1/api_keys",
+		"--input", "-",
 		"--api-key", "bk_test_UNIT0001", "--base-url", srv.URL); err != nil {
 		t.Fatal(err)
 	}
@@ -117,20 +154,20 @@ func TestAPIJSONBodySendsArraysAndNestedObjects(t *testing.T) {
 	}
 	// Still a mutating call, so the safety rails apply.
 	if m[0].idem == "" {
-		t.Error("--json must not become the one keyless way to POST")
+		t.Error("--input must not become the one keyless way to POST")
 	}
 }
 
 // The body travels verbatim. Decoding into map[string]any and re-encoding
 // turns every number into a float64, which silently rewrites an integer past
-// 2^53 — and an amount in minor units is exactly that shape.
+// 2^53, and an amount in minor units is exactly that shape.
 func TestAPIJSONBodyIsNotRoundTrippedThroughFloat64(t *testing.T) {
 	rec := &recorder{}
 	srv := tlsStub(t, rec.handler())
 
 	const big = "9007199254740993" // 2^53 + 1
-	if _, err := runCLI(t, "api", "POST", "/v1/anything",
-		"--json", `{"amount_cents":`+big+`}`,
+	if _, err := runCLIWithStdin(t, strings.NewReader(`{"amount_cents":`+big+`}`), "api", "POST", "/v1/anything",
+		"--input", "-",
 		"--api-key", "bk_test_UNIT0001", "--base-url", srv.URL); err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +187,7 @@ func TestAPIJSONBodySources(t *testing.T) {
 		if err := os.WriteFile(path, []byte(`{"from":"file"}`), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := runCLI(t, append([]string{"api", "POST", "/v1/x", "--json", "@" + path}, auth...)...); err != nil {
+		if _, err := runCLI(t, append([]string{"api", "POST", "/v1/x", "--input", path}, auth...)...); err != nil {
 			t.Fatal(err)
 		}
 		if m := rec.mutations(); !strings.Contains(m[len(m)-1].body, `"from":"file"`) {
@@ -160,7 +197,7 @@ func TestAPIJSONBodySources(t *testing.T) {
 
 	t.Run("from stdin", func(t *testing.T) {
 		if _, err := runCLIWithStdin(t, strings.NewReader(`{"from":"stdin"}`),
-			append([]string{"api", "POST", "/v1/x", "--json", "-"}, auth...)...); err != nil {
+			append([]string{"api", "POST", "/v1/x", "--input", "-"}, auth...)...); err != nil {
 			t.Fatal(err)
 		}
 		if m := rec.mutations(); !strings.Contains(m[len(m)-1].body, `"from":"stdin"`) {
@@ -168,27 +205,72 @@ func TestAPIJSONBodySources(t *testing.T) {
 		}
 	})
 
-	t.Run("bad input is refused locally", func(t *testing.T) {
+	t.Run("bad input is refused locally, as a bad invocation", func(t *testing.T) {
+		before := len(rec.mutations())
 		for _, bad := range []string{`{"a":`, `[1,2]`, `"just a string"`, `   `} {
-			_, err := runCLI(t, append([]string{"api", "POST", "/v1/x", "--json", bad}, auth...)...)
+			_, err := runCLIWithStdin(t, strings.NewReader(bad), append([]string{"api", "POST", "/v1/x", "--input", "-"}, auth...)...)
 			if err == nil {
-				t.Errorf("--json %q should not have reached the wire", bad)
+				t.Errorf("--input holding %q should not have reached the wire", bad)
+				continue
 			}
+			if got := ExitCode(err); got != ExitUsage {
+				t.Errorf("--input holding %q: ExitCode = %d, want %d (%v)", bad, got, ExitUsage, err)
+			}
+		}
+		if after := len(rec.mutations()); after != before {
+			t.Fatalf("a refused body reached the wire %d time(s)", after-before)
 		}
 	})
 
-	t.Run("data and json cannot be combined", func(t *testing.T) {
-		if _, err := runCLI(t, append([]string{"api", "POST", "/v1/x",
-			"--json", `{"a":1}`, "--data", "b=2"}, auth...)...); err == nil {
-			t.Fatal("--data and --json describe the same thing two ways and must be exclusive")
+	t.Run("a missing file is a failure to read, named as such", func(t *testing.T) {
+		_, err := runCLI(t, append([]string{"api", "POST", "/v1/x", "--input", filepath.Join(t.TempDir(), "nope.json")}, auth...)...)
+		if err == nil || !strings.Contains(err.Error(), "could not read the request body") {
+			t.Fatalf("want a read error, got %v", err)
+		}
+		if got := ExitCode(err); got != ExitUsage {
+			t.Fatalf("an unreadable --input file: ExitCode = %d, want %d", got, ExitUsage)
+		}
+	})
+
+	t.Run("inline JSON is not a file name", func(t *testing.T) {
+		// --input is gh's flag with gh's meaning: a path or -. The 0.x
+		// --json took the object inline too; that spelling is a missing
+		// file now, not a silently different request.
+		_, err := runCLI(t, append([]string{"api", "POST", "/v1/x", "--input", `{"a":1}`}, auth...)...)
+		if err == nil {
+			t.Fatal("inline JSON passed to --input must not be sent")
+		}
+	})
+
+	t.Run("data and input cannot be combined", func(t *testing.T) {
+		_, err := runCLIWithStdin(t, strings.NewReader(`{"a":1}`), append([]string{"api", "POST", "/v1/x",
+			"--input", "-", "--data", "b=2"}, auth...)...)
+		if err == nil {
+			t.Fatal("--data and --input describe the same thing two ways and must be exclusive")
+		}
+		if got := ExitCode(err); got != ExitUsage {
+			t.Errorf("ExitCode = %d, want %d", got, ExitUsage)
+		}
+	})
+
+	t.Run("the 0.x --json body flag is gone", func(t *testing.T) {
+		// --json is the global "machine-readable output" flag now. As a
+		// body flag on `api` it would mean two unrelated things on one
+		// command line, so it is a boolean here and takes no value.
+		_, err := runCLI(t, append([]string{"api", "POST", "/v1/x", "--json", `{"a":1}`}, auth...)...)
+		if err == nil {
+			t.Fatal("`api --json <body>` must not send a request")
+		}
+		if got := ExitCode(err); got != ExitUsage {
+			t.Errorf("ExitCode = %d, want %d (%v)", got, ExitUsage, err)
 		}
 	})
 }
 
 // TestAPISendsNoBodyWhenNoneWasGiven. `var body map[string]any` left nil and
 // passed as an `any` is a non-nil interface holding a nil map, so the client's
-// `body != nil` check was true and every bodyless call — every `billkit api
-// GET` — went out with a literal `null` payload and a JSON content type. Some
+// `body != nil` check was true and every bodyless call (every `billkit api
+// GET`) went out with a literal `null` payload and a JSON content type. Some
 // proxies refuse a GET with a body outright.
 func TestAPISendsNoBodyWhenNoneWasGiven(t *testing.T) {
 	rec := &recorder{}
@@ -203,7 +285,7 @@ func TestAPISendsNoBodyWhenNoneWasGiven(t *testing.T) {
 		t.Fatalf("want one request, got %+v", all)
 	}
 	if all[0].body != "" {
-		t.Fatalf("a call with no --data and no --json must send no body, got %q", all[0].body)
+		t.Fatalf("a call with no --data and no --input must send no body, got %q", all[0].body)
 	}
 }
 
@@ -218,17 +300,21 @@ func TestAPIRefusesABodyOnAReadMethod(t *testing.T) {
 
 	for _, tc := range []struct{ method, flag, value string }{
 		{"GET", "--data", "email=ada@example.test"},
-		{"GET", "--json", `{"email":"ada@example.test"}`},
+		{"GET", "--input", "-"},
 		{"HEAD", "--data", "email=ada@example.test"},
 	} {
 		t.Run(tc.method+tc.flag, func(t *testing.T) {
-			_, err := runCLI(t, "api", tc.method, "/v1/customers", tc.flag, tc.value,
+			_, err := runCLIWithStdin(t, strings.NewReader(`{"email":"ada@example.test"}`),
+				"api", tc.method, "/v1/customers", tc.flag, tc.value,
 				"--api-key", "bk_test_UNIT0001", "--base-url", srv.URL)
 			if err == nil {
 				t.Fatalf("%s with %s was accepted", tc.method, tc.flag)
 			}
 			if !strings.Contains(err.Error(), tc.flag) {
 				t.Errorf("the error must name the flag to drop, got %v", err)
+			}
+			if got := ExitCode(err); got != ExitUsage {
+				t.Errorf("ExitCode = %d, want %d", got, ExitUsage)
 			}
 		})
 	}

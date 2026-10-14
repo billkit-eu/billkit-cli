@@ -27,7 +27,7 @@ func TestValidateEventTypesAcceptsTheWholeCatalogue(t *testing.T) {
 }
 
 // A trailing comma is a slip, not a typo'd event name, and the server drops
-// empty entries too — so reporting one would be a false alarm on input that
+// empty entries too, so reporting one would be a false alarm on input that
 // works.
 func TestValidateEventTypesIgnoresEmptyEntries(t *testing.T) {
 	for _, in := range []string{"", ",", "invoice.paid,", " invoice.paid , "} {

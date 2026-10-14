@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -27,15 +29,119 @@ type Client struct {
 }
 
 // New builds a client; baseURL falls back to the production host upstream.
+//
+// Whatever *http.Client the caller hands in, the one this Client uses follows
+// redirects only under FollowSafeRedirects. It is enforced here rather than
+// left to each caller because every request this package makes carries the
+// API key, and a single constructor that forgot the policy would be enough to
+// leak it.
 func New(baseURL, apiKey, version string, httpClient *http.Client) *Client {
-	if httpClient == nil {
-		httpClient = http.DefaultClient
+	hc := http.Client{}
+	if httpClient != nil {
+		hc = *httpClient
 	}
+	hc.CheckRedirect = FollowSafeRedirects
 	return &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		APIKey:  apiKey,
 		Version: version,
-		HTTP:    httpClient,
+		HTTP:    &hc,
+	}
+}
+
+// maxRedirects is net/http's own default hop limit, which a custom
+// CheckRedirect has to enforce itself.
+const maxRedirects = 10
+
+// FollowSafeRedirects is the CheckRedirect policy for every client that sends
+// the API key on an ordinary call. The API does redirect one kind of request:
+// an invoice or credit-note PDF under S3 storage answers 302 with a presigned
+// URL on the storage host. So a redirect is followed, but only on terms that
+// keep the key where config.CheckTransport put it, which it checked once,
+// against the configured base URL, and never re-checks per hop:
+//
+//   - the target must be https. A plain http target is refused when the call
+//     started on https, which is the downgrade net/http would otherwise make
+//     with Authorization attached, because it re-sends that header to the
+//     same host whatever the scheme. The one http target allowed is the same
+//     host as an http base URL (a loopback test API), which is no downgrade.
+//   - Authorization is dropped the moment any hop leaves the original
+//     host:port, and stays dropped. net/http strips it on a host change too,
+//     but it compares hostnames without the port, and it copies the header
+//     back from the first request on every hop; neither is a rule to rely on
+//     for a live key.
+//
+// A refused redirect hands the 3xx back to the caller (http.ErrUseLastResponse),
+// and Do turns it into a redirectError.
+func FollowSafeRedirects(req *http.Request, via []*http.Request) error {
+	if len(via) == 0 {
+		return nil
+	}
+	if len(via) >= maxRedirects {
+		return http.ErrUseLastResponse
+	}
+	origin := via[0].URL
+	switch strings.ToLower(req.URL.Scheme) {
+	case "https":
+	case "http":
+		if !strings.EqualFold(origin.Scheme, "http") || !SameOrigin(origin, req.URL) {
+			return http.ErrUseLastResponse
+		}
+	default:
+		return http.ErrUseLastResponse
+	}
+	left := !SameOrigin(origin, req.URL)
+	for _, hop := range via[1:] {
+		if !SameOrigin(origin, hop.URL) {
+			left = true
+		}
+	}
+	if left {
+		req.Header.Del("Authorization")
+	}
+	return nil
+}
+
+// RefuseRedirects is the CheckRedirect policy for a client that must never
+// follow one: the `listen` event stream, which carries the key and has no
+// legitimate reason to be redirected. The 3xx is handed back to the caller.
+func RefuseRedirects(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
+}
+
+// SameOrigin reports whether two URLs share scheme, host and port, with the
+// scheme's default port filled in so https://h and https://h:443 compare
+// equal.
+func SameOrigin(a, b *url.URL) bool {
+	return strings.EqualFold(a.Scheme, b.Scheme) && hostPort(a) == hostPort(b)
+}
+
+func hostPort(u *url.URL) string {
+	port := u.Port()
+	if port == "" {
+		switch strings.ToLower(u.Scheme) {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		}
+	}
+	return net.JoinHostPort(strings.ToLower(u.Hostname()), port)
+}
+
+// redirectError is what a refused redirect surfaces as. It is an APIError,
+// with the 3xx status, so the rest of the CLI treats it like any other
+// definite answer from the server: not retried, and not "the outcome is
+// unknown", because nothing was done at the address that was asked.
+func redirectError(status int, location string) *APIError {
+	if location == "" {
+		location = "another address"
+	}
+	return &APIError{
+		StatusCode: status,
+		Message: fmt.Sprintf("the server redirected this request to %s, and billkit refused to follow it: "+
+			"a redirect is followed only to https, never from https to plain http, "+
+			"so your API key cannot be carried over an unencrypted connection. Check the path and --base-url", location),
 	}
 }
 
@@ -43,7 +149,7 @@ func New(baseURL, apiKey, version string, httpClient *http.Client) *Client {
 type RequestOption func(*http.Request)
 
 // WithIdempotencyKey sets the Idempotency-Key header so a retried create can't
-// double-charge — matching every BillKit SDK's idempotency contract. A blank
+// double-charge, matching every BillKit SDK's idempotency contract. A blank
 // key is a no-op.
 func WithIdempotencyKey(key string) RequestOption {
 	return func(r *http.Request) {
@@ -199,8 +305,12 @@ func (c *Client) Do(ctx context.Context, method, path string, body any, opts ...
 		}
 		replayable := SafeMethod(method) || req.Header.Get("Idempotency-Key") != ""
 
-		data, status, retryAfter, err := c.roundTrip(req)
-		if err == nil && (status < 200 || status >= 300) {
+		data, status, header, err := c.roundTrip(req)
+		switch {
+		case err != nil:
+		case status >= 300 && status < 400:
+			err = redirectError(status, header.Get("Location"))
+		case status < 200 || status >= 300:
 			err = ParseError(status, data)
 		}
 		if err == nil {
@@ -209,7 +319,7 @@ func (c *Client) Do(ctx context.Context, method, path string, body any, opts ...
 		if attempt >= maxRetries || !replayable || !retryableFailure(status, err) || ctx.Err() != nil {
 			return nil, err
 		}
-		if !sleepBackoff(ctx, attempt, retryAfter) {
+		if !sleepBackoff(ctx, attempt, ParseRetryAfter(header.Get("Retry-After"))) {
 			// The deadline ran out mid-backoff; report the failure that
 			// actually happened rather than a context error.
 			return nil, err
@@ -245,10 +355,10 @@ func (c *Client) newRequest(ctx context.Context, method, path string, encoded []
 
 // roundTrip performs one attempt and fully reads the body so the connection
 // can be reused by the next one.
-func (c *Client) roundTrip(req *http.Request) (data []byte, status int, retryAfter time.Duration, err error) {
+func (c *Client) roundTrip(req *http.Request) (data []byte, status int, header http.Header, err error) {
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, 0, http.Header{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -259,9 +369,9 @@ func (c *Client) roundTrip(req *http.Request) (data []byte, status int, retryAft
 		// the request did not complete. Reporting the real status here made
 		// retryableFailure see a 200 and refuse to retry a connection that
 		// never delivered an answer, which is the exact case the retry exists for.
-		return nil, 0, 0, err
+		return nil, 0, http.Header{}, err
 	}
-	return data, resp.StatusCode, ParseRetryAfter(resp.Header.Get("Retry-After")), nil
+	return data, resp.StatusCode, resp.Header, nil
 }
 
 // retryableFailure reports whether a failed attempt is worth repeating.

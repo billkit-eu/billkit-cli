@@ -1,0 +1,125 @@
+# billkit, the public Go CLI.
+#
+#   mise run //cli:check        gofmt + go vet + golangci-lint + go test -race + tidy check
+#   mise run //cli:integration  the built binary against a real API (see below)
+#   mise run //cli:vulncheck    govulncheck (needs the network for the vuln DB)
+#   mise run //cli:release-check  goreleaser check + a snapshot build, publishing nothing
+#
+# This file travels to the public mirror with the rest of cli/, so every task
+# here works there too; the one that can use monorepo-only scaffolding says so.
+
+[tasks.fmt-check]
+description = "gofmt: list unformatted files and fail if there are any"
+dir = "{{ config_root }}"
+run = 'test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }'
+
+[tasks.vet]
+description = "go vet, including the integration-tagged package"
+dir = "{{ config_root }}"
+run = ["go vet ./...", "go vet -tags integration ./..."]
+
+[tasks.lint]
+description = "golangci-lint (config in .golangci.yml)"
+dir = "{{ config_root }}"
+run = "golangci-lint run"
+
+[tasks.test]
+description = "Unit tests with the race detector"
+dir = "{{ config_root }}"
+run = "go test -race -count=1 -cover ./..."
+
+# go.mod and go.sum must already be tidy. GoReleaser used to run `go mod
+# tidy` as a before-hook, which rewrote them on the release runner: the
+# binary was then built from a module graph no commit contains.
+[tasks.tidy-check]
+description = "Fail if go.mod/go.sum are not tidy"
+dir = "{{ config_root }}"
+run = "go mod tidy -diff"
+
+[tasks.check]
+description = "CLI: gofmt + vet + golangci-lint + go test -race + tidy check"
+depends = ["fmt-check", "vet", "lint", "test", "tidy-check"]
+
+[tasks.vulncheck]
+description = "govulncheck against the Go vulnerability database"
+dir = "{{ config_root }}"
+run = "go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./..."
+
+[tasks.release-check]
+description = "goreleaser check + snapshot build (publishes nothing; skips signing and SBOMs)"
+dir = "{{ config_root }}"
+run = [
+    "goreleaser check",
+    "goreleaser release --snapshot --clean --skip=sign,sbom,notarize",
+]
+
+# The built binary against a live API: login against /v1/ping, the list
+# commands, trigger -> listen -> a local receiver with the signature checked
+# against the session secret, events list, and listen's resume after a
+# dropped stream. test/integration/integration_test.go is the detail.
+#
+# With BILLKIT_INTEGRATION_BASE_URL set, it runs against that API, which must
+# have been booted with BILLKIT_E2E_TEST_LOGIN=1 (each run provisions its own
+# tenant). Without it, in the monorepo, it boots an API of its own on :8025
+# (CLI_IT_PORT) against database billkit_cli_it (CLI_IT_DB_NAME) on the
+# harness Postgres (:5434), for the duration of the run.
+#
+# Its own port and database, not the SDK suites' :8020 and billkit_sdk_it:
+# the health check below cannot tell one BillKit API from another, so on a
+# shared port it passed against whichever suite booted first and the run then
+# provisioned tenants in, and raced, that suite's database. It refuses to
+# start when anything already listens on its port, for the same reason.
+[tasks.integration]
+description = "CLI integration suite: the built binary against a real API (:8025)"
+dir = "{{ config_root }}"
+shell = "bash -c -o errexit -o nounset -o pipefail"
+run = '''
+if [ -n "${BILLKIT_INTEGRATION_BASE_URL:-}" ]; then
+  exec go test -tags integration -count=1 -v ./test/integration/...
+fi
+
+boot="{{ config_root }}/../sdk/integration/boot-api.sh"
+compose=(docker compose -p billkit-harness -f "{{ config_root }}/../api/docker-compose.harness.yml")
+if [ ! -f "$boot" ]; then
+  echo "Set BILLKIT_INTEGRATION_BASE_URL to an API booted with BILLKIT_E2E_TEST_LOGIN=1." >&2
+  exit 2
+fi
+
+port="${CLI_IT_PORT:-8025}"
+db="${CLI_IT_DB_NAME:-billkit_cli_it}"
+url="http://127.0.0.1:$port"
+log="${TMPDIR:-/tmp}/billkit-cli-it.log"
+
+if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "cli integration: something is already listening on :$port; refusing to share it" >&2
+  exit 1
+fi
+
+echo "── cli integration: Postgres up (waiting for healthy)"
+"${compose[@]}" up -d --wait postgres
+# The harness's init script only runs on an empty volume, so create this
+# suite's database idempotently; never touch the others.
+"${compose[@]}" exec -T postgres psql -U billkit -d postgres -v ON_ERROR_STOP=1 -tAc \
+  "SELECT 1 FROM pg_database WHERE datname = '$db'" | grep -q 1 \
+  || "${compose[@]}" exec -T postgres psql -U billkit -d postgres -v ON_ERROR_STOP=1 \
+       -c "CREATE DATABASE $db OWNER billkit"
+
+echo "── cli integration: booting API on :$port, database $db (log: $log)"
+SDK_IT_DB_NAME="$db" BILLKIT_INTEGRATION_PORT="$port" bash "$boot" > "$log" 2>&1 &
+api_pid=$!
+# The API runs under uv, so stop the children and the uvicorn on this port,
+# not just the wrapper.
+trap 'pkill -P "$api_pid" 2>/dev/null || true; kill "$api_pid" 2>/dev/null || true; pkill -f "uvicorn billkit.main:app --host 127.0.0.1 --port $port" 2>/dev/null || true' EXIT
+
+for _ in $(seq 1 120); do
+  curl -sf "$url/healthz" >/dev/null 2>&1 && break
+  sleep 1
+done
+if ! curl -sf "$url/healthz" >/dev/null 2>&1; then
+  echo "API failed to boot; last 40 lines:"
+  tail -40 "$log"
+  exit 1
+fi
+
+BILLKIT_INTEGRATION_BASE_URL="$url" go test -tags integration -count=1 -v ./test/integration/...
+'''

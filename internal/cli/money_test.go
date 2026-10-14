@@ -120,7 +120,7 @@ func TestRefundsCreateAlwaysSendsAnIdempotencyKey(t *testing.T) {
 		t.Fatalf("mutating requests = %d, want 1", len(mutations))
 	}
 	if mutations[0].idem == "" {
-		t.Fatal("POST /v1/refunds went out with no Idempotency-Key — a retry after a timeout refunds twice")
+		t.Fatal("POST /v1/refunds went out with no Idempotency-Key: a retry after a timeout refunds twice")
 	}
 	if !strings.Contains(stderr, mutations[0].idem) {
 		t.Fatalf("the key must be printed before the call so a retry can reuse it; stderr = %q", stderr)
@@ -144,16 +144,16 @@ func TestRefundsCreateKeepsAUserSuppliedKey(t *testing.T) {
 	}
 }
 
-// TestCheckoutOneShotAlwaysSendsAnIdempotencyKey is the P0-2 regression for
+// TestOneShotsCreateAlwaysSendsAnIdempotencyKey is the P0-2 regression for
 // the charge path, where a blind re-run creates a second real Mollie charge.
-func TestCheckoutOneShotAlwaysSendsAnIdempotencyKey(t *testing.T) {
+func TestOneShotsCreateAlwaysSendsAnIdempotencyKey(t *testing.T) {
 	rec := &recorder{}
 	srv := httptest.NewServer(rec.handler())
 	defer srv.Close()
 
 	stderr, err := runCLI(t,
-		"checkout", "one-shot", "--customer", "cus_1", "--amount", "1999",
-		"--method", "ideal", "--success-url", "https://example.test/ok",
+		"one-shots", "create", "--customer", "cus_1", "--amount", "1999",
+		"--payment-method", "ideal", "--success-url", "https://example.test/ok",
 		"--api-key", "bk_test_x", "--base-url", srv.URL)
 	if err != nil {
 		t.Fatal(err)
@@ -164,21 +164,21 @@ func TestCheckoutOneShotAlwaysSendsAnIdempotencyKey(t *testing.T) {
 		t.Fatalf("mutating requests = %d, want 1", len(mutations))
 	}
 	if mutations[0].idem == "" {
-		t.Fatal("POST /v1/checkout/one_shot went out with no Idempotency-Key — a retry charges the customer twice")
+		t.Fatal("POST /v1/checkout/one_shot went out with no Idempotency-Key: a retry charges the customer twice")
 	}
 	if !strings.Contains(stderr, mutations[0].idem) {
 		t.Fatalf("the key must be printed before the call; stderr = %q", stderr)
 	}
 }
 
-func TestCheckoutOneShotKeepsAUserSuppliedKey(t *testing.T) {
+func TestOneShotsCreateKeepsAUserSuppliedKey(t *testing.T) {
 	rec := &recorder{}
 	srv := httptest.NewServer(rec.handler())
 	defer srv.Close()
 
 	if _, err := runCLI(t,
-		"checkout", "one-shot", "--customer", "cus_1", "--amount", "1999",
-		"--method", "ideal", "--success-url", "https://example.test/ok",
+		"one-shots", "create", "--customer", "cus_1", "--amount", "1999",
+		"--payment-method", "ideal", "--success-url", "https://example.test/ok",
 		"--idempotency-key", "mine-99",
 		"--api-key", "bk_test_x", "--base-url", srv.URL); err != nil {
 		t.Fatal(err)
@@ -242,7 +242,7 @@ func TestLoginMakesTheNewProfileDefault(t *testing.T) {
 		t.Fatalf("mutating requests = %d, want 1", len(mutations))
 	}
 	if got := mutations[0].auth; got != "Bearer bk_test_BBBB2222" {
-		t.Fatalf("refund went out as %q, want the test key the CLI just said it logged into — "+
+		t.Fatalf("refund went out as %q, want the test key the CLI just said it logged into: "+
 			"that is real money spent moments after the CLI reported test mode", got)
 	}
 }
@@ -405,13 +405,23 @@ func TestHostAnnouncementIsPerCommandTree(t *testing.T) {
 }
 
 func TestDescribeRefund(t *testing.T) {
-	partial := describeRefund(map[string]any{"payment_id": "pay_1", "amount_cents": int64(500)})
-	if partial != "refund 500 cents of pay_1" {
-		t.Errorf("describeRefund(partial) = %q", partial)
+	cases := []struct {
+		body     map[string]any
+		currency string
+		want     string
+	}{
+		// The amount is minor units of the target's currency, so it is
+		// formatted with that currency's exponent once the currency is known.
+		{map[string]any{"payment_id": "pay_1", "amount_cents": int64(500)}, "EUR", "refund EUR 5.00 of pay_1"},
+		{map[string]any{"one_shot_payment_id": "osp_1", "amount_cents": int64(500)}, "jpy", "refund JPY 500 of osp_1"},
+		// Unknown currency: the raw number, called what it is.
+		{map[string]any{"payment_id": "pay_1", "amount_cents": int64(500)}, "", "refund 500 minor units (currency unknown) of pay_1"},
+		{map[string]any{"subscription_id": "sub_9"}, "", "refund the full remaining balance of sub_9's latest charge"},
 	}
-	full := describeRefund(map[string]any{"subscription_id": "sub_9"})
-	if full != "refund the full remaining balance of sub_9" {
-		t.Errorf("describeRefund(full) = %q", full)
+	for _, tc := range cases {
+		if got := describeRefund(tc.body, tc.currency); got != tc.want {
+			t.Errorf("describeRefund(%v, %q) = %q, want %q", tc.body, tc.currency, got, tc.want)
+		}
 	}
 }
 
@@ -507,9 +517,26 @@ func TestAmbiguousGuidanceCoversEveryUnknownOutcome(t *testing.T) {
 		{
 			// The server saying the request itself was wrong. Nothing
 			// happened, and guidance here teaches people to ignore it.
-			name:    "422 validation",
-			status:  http.StatusUnprocessableEntity,
-			body:    `{"error":{"code":"invalid_request","message":"bad amount"}}`,
+			name:    "400 validation",
+			status:  http.StatusBadRequest,
+			body:    `{"error":{"type":"invalid_request_error","code":"parameter_invalid","message":"bad amount","param":"amount_cents"}}`,
+			wantAmb: false,
+		},
+		{
+			// The payment provider declined. It answered, so the outcome is
+			// known: nothing was charged or refunded.
+			name:    "402 payment_refused",
+			status:  http.StatusPaymentRequired,
+			body:    `{"error":{"type":"payment_error","code":"payment_refused","message":"refused","reason":"payment_refused"}}`,
+			wantAmb: false,
+		},
+		{
+			// A refusal of the object's current state (refunding a fully
+			// refunded payment, pausing a canceled subscription). The
+			// server looked and declined: nothing happened.
+			name:    "409 state_conflict",
+			status:  http.StatusConflict,
+			body:    `{"error":{"type":"conflict_error","code":"state_conflict","message":"already refunded","reason":"already_refunded"}}`,
 			wantAmb: false,
 		},
 		{

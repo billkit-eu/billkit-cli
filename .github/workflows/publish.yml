@@ -2,7 +2,8 @@ name: Release
 
 # Triggered by pushing a tag of the form ``vX.Y.Z``. GoReleaser builds the
 # darwin/linux/windows matrix, signs and notarizes the darwin binaries with the
-# Developer ID certificate, signs checksums.txt with cosign, publishes the
+# Developer ID certificate, writes an SBOM per archive with syft, signs
+# checksums.txt with cosign, publishes the
 # GitHub release with checksums, and pushes the Homebrew cask to
 # billkit-eu/homebrew-tap.
 #
@@ -20,6 +21,12 @@ name: Release
 # Tags are pushed by ``mise run release-sdk cli <version>`` upstream, which
 # checks the same things this job re-checks. It re-checks them because the tag is
 # the irreversible step and a published release cannot be taken back cleanly.
+#
+# Every action is pinned to a full commit SHA, with the release it was cut from
+# in a comment. This job holds ``id-token: write`` and a token that can publish
+# a release, so a tag moved upstream would run whatever it now points at with
+# both. Bump a pin in a reviewed diff: look the SHA up with
+# ``gh api repos/<owner>/<action>/commits/<tag> --jq .sha``.
 on:
   push:
     tags:
@@ -41,22 +48,41 @@ jobs:
     name: GoReleaser
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # GoReleaser builds the changelog from the commits since the last tag,
           # so a shallow clone gives it nothing to read.
           fetch-depth: 0
 
-      - uses: actions/setup-go@v7
+      # The Go release comes from go.mod, whose `toolchain` line names the
+      # exact patch release. `go-version: '1.26'` floated to whatever 1.26.x
+      # the runner image had that day, so the same tag could be built by two
+      # different compilers, and the CHANGELOG's "built with" line was a hope.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26'
+          go-version-file: go.mod
 
       # cosign, for the keyless signature over checksums.txt. It signs with the
       # OIDC token minted by `id-token: write` above and records the signature
       # in the public Rekor transparency log, so `install.sh` (and anyone else)
       # can verify that a release came from this workflow, at this tag, without
       # us publishing and defending a signing key.
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+
+      # syft, for the per-archive SBOMs in the `sboms:` block of
+      # .goreleaser.yaml. GoReleaser shells out to it and fails the release
+      # when it is missing, which is the right failure: an SBOM that silently
+      # stopped being published is one nobody notices is gone.
+      #
+      # Pinned by commit, not by the floating v0 tag: this job holds
+      # `id-token: write` and the release token, so a moved tag would run
+      # whatever it pointed at with both. (v0 was also stale, still at v0.24.0
+      # when v0.24.3 shipped.) syft-version is explicit for the same reason the
+      # action is pinned: the SBOM generator should change in a reviewed diff,
+      # not whenever upstream cuts a release. Bump both together.
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          syft-version: v1.54.1
 
       - name: Verify the tag matches the declared version
         run: |
@@ -71,8 +97,17 @@ jobs:
             exit 1
           fi
 
+      # go.mod and go.sum must be tidy as committed. GoReleaser used to run
+      # `go mod tidy` itself, which built the release from a module graph no
+      # commit contains; now an untidy tree fails here instead.
+      - name: go.mod is tidy
+        run: go mod tidy -diff
+
       - name: Test
-        run: go test ./...
+        run: go test -race ./...
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
       - name: Report the Homebrew tap state
         env:
@@ -82,12 +117,16 @@ jobs:
             echo "::notice::No HOMEBREW_TAP_TOKEN secret, so the Homebrew cask will be skipped. The GitHub release and install.sh are unaffected. Add the secret to publish the cask to billkit-eu/homebrew-tap."
           fi
 
-      # Same bargain as the tap token: a missing credential skips a step, it does
-      # not fail a release. But an unsigned macOS build is a user-visible
-      # regression now that the cask no longer strips the quarantine flag, so it
-      # is a warning rather than a notice, and it names every variable that is
-      # missing instead of only the first.
-      - name: Report the macOS signing state
+      # Mandatory. This used to be the same bargain as the tap token, a missing
+      # credential skipping the step with a warning, and that was wrong for
+      # this one: Homebrew casks quarantine what they install, so an unsigned
+      # darwin build is killed by Gatekeeper at first launch on every user's
+      # Mac while this job stays green. A release without all five secrets
+      # now fails here, before anything is built or published, naming every
+      # one that is missing. `.goreleaser.yaml` enforces the same rule a
+      # second time, so a release that skipped this step still cannot ship
+      # unsigned.
+      - name: Require the macOS signing credentials
         env:
           MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
           MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
@@ -102,14 +141,17 @@ jobs:
           [ -n "$MACOS_NOTARY_KEY_ID" ]    || missing="$missing MACOS_NOTARY_KEY_ID"
           [ -n "$MACOS_NOTARY_KEY" ]       || missing="$missing MACOS_NOTARY_KEY"
           if [ -n "$missing" ]; then
-            echo "::warning::Skipping macOS signing and notarization; missing secrets:$missing. The release still builds and publishes, but the darwin binaries will be unsigned and macOS will refuse to run them without the user overriding Gatekeeper. Set all five secrets in this repository to fix it."
-          else
-            echo "::notice::Signing and notarizing the darwin binaries with the Developer ID Application certificate."
+            echo "::error::Refusing to release unsigned darwin binaries; missing secrets:$missing. Set all five in this repository's Actions secrets and re-run."
+            exit 1
           fi
+          echo "::notice::Signing and notarizing the darwin binaries with the Developer ID Application certificate."
 
-      - uses: goreleaser/goreleaser-action@v7
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
-          version: '~> v2'
+          # An exact release, like every other tool here. `~> v2` took
+          # whatever v2.x shipped on the morning of a release, so a GoReleaser
+          # change could alter the artifacts with nothing in this diff.
+          version: v2.18.3
           # `--timeout 60m` because notarization is a round trip to Apple, once
           # per darwin binary, and GoReleaser's own default is 30m for the whole
           # release. Without this the second submission can be killed mid-flight.
@@ -120,8 +162,8 @@ jobs:
           # "skip the cask" rather than failing the release over it.
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           # Developer ID signing + Apple notarization, read by the `notarize:`
-          # block in `.goreleaser.yaml`. Same empty-means-skip contract: all five
-          # present signs and notarizes, any one absent skips the whole step.
+          # block in `.goreleaser.yaml`. Required: a release (not a snapshot)
+          # with any of the five empty fails rather than shipping unsigned.
           #
           # MACOS_SIGN_P12         base64 of the Developer ID Application .p12
           # MACOS_SIGN_PASSWORD    the password that .p12 was exported with

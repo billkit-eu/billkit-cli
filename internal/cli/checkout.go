@@ -1,7 +1,11 @@
 package cli
 
+// The `one-shots` command group. The file keeps its old name because
+// api/tests/test_cli_one_shot_methods.py reads `oneShotMethods` out of
+// cli/internal/cli/checkout.go by path, and the API route it drives is
+// /v1/checkout/one_shot.
+
 import (
-	"context"
 	"fmt"
 	"net/url"
 	"slices"
@@ -21,9 +25,11 @@ import (
 // since the enum gained it, which is what
 // api/tests/test_cli_one_shot_methods.py now makes impossible in either
 // direction, the way test_cli_event_constants.py does for event types.
+//
+// No directdebit: SEPA Direct Debit collects against a mandate and a one-off
+// charge has none, so the API's enum does not list it and neither does this.
 var oneShotMethods = []string{
 	"creditcard",
-	"directdebit",
 	"ideal",
 	"bancontact",
 	"eps",
@@ -34,16 +40,24 @@ var oneShotMethods = []string{
 	"banktransfer",
 }
 
-func checkoutCmd(g *globals) *cobra.Command {
+// oneShotsCmd is the resource group for one-off payments, shaped like
+// `refunds` and `events`: create, list, retrieve.
+//
+// It replaced `checkout one-shot` / `checkout retrieve` before 1.0. A
+// `checkout` group whose only member was not a checkout session read as
+// though one-shots were a kind of session, and its `retrieve` could only
+// ever fetch one-shots. `checkout` is left free for checkout sessions, the
+// way the Stripe CLI spells them (`checkout sessions create`).
+func oneShotsCmd(g *globals) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "checkout",
+		Use:   "one-shots",
 		Short: "Create and inspect one-off (one-shot) payments",
 	}
-	cmd.AddCommand(checkoutOneShotCmd(g), checkoutRetrieveCmd(g))
+	cmd.AddCommand(oneShotsCreateCmd(g), oneShotsListCmd(g), oneShotsRetrieveCmd(g))
 	return cmd
 }
 
-func checkoutOneShotCmd(g *globals) *cobra.Command {
+func oneShotsCreateCmd(g *globals) *cobra.Command {
 	var (
 		customer         string
 		amount           int64
@@ -59,26 +73,27 @@ func checkoutOneShotCmd(g *globals) *cobra.Command {
 		idemKey          string
 	)
 	cmd := &cobra.Command{
-		Use:   "one-shot",
-		Short: "Create a single off-session charge (no subscription, no saved mandate)",
-		Long: "Create a one-off `sequenceType=oneoff` charge and print the payment.\n\n" +
-			"Hosted (the default) needs --method and prints the Mollie hosted\n" +
+		Use:   "create",
+		Short: "Create a single one-off charge (no subscription, no saved mandate)",
+		Long: "Create a single one-off charge and print the payment. The customer pays\n" +
+			"it on a hosted page or in the payment element; nothing is saved for later.\n\n" +
+			"Hosted (the default) needs --payment-method and prints the Mollie hosted\n" +
 			"`redirect_url` to send the customer to:\n\n" +
-			"  billkit checkout one-shot \\\n" +
-			"    --customer cus_123 --amount 1999 --method ideal \\\n" +
+			"  billkit one-shots create \\\n" +
+			"    --customer cus_123 --amount 1999 --payment-method ideal \\\n" +
 			"    --success-url https://example.com/thanks\n\n" +
-			"--ui-mode embedded takes no --method: the customer picks it in the\n" +
+			"--ui-mode embedded takes no --payment-method: the customer picks it in the\n" +
 			"BillKit payment element on your own page, and the payment is printed\n" +
 			"with a short-lived `client_secret` for that element instead of a\n" +
 			"redirect URL:\n\n" +
-			"  billkit checkout one-shot --ui-mode embedded \\\n" +
+			"  billkit one-shots create --ui-mode embedded \\\n" +
 			"    --customer cus_123 --amount 1999 \\\n" +
 			"    --success-url https://example.com/thanks",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			meta, err := parseMetadata(metadata)
 			if err != nil {
-				return err
+				return &UsageError{err}
 			}
 			body, err := buildOneShotBody(oneShotParams{
 				customer:         customer,
@@ -108,8 +123,8 @@ func checkoutOneShotCmd(g *globals) *cobra.Command {
 				path:     "/v1/checkout/one_shot",
 				body:     body,
 				moves:    true,
-				what:     fmt.Sprintf("charge %d %s to %s %s", amount, currency, customer, via),
-				checkCmd: "billkit events list --type one_shot_payment.created",
+				what:     fmt.Sprintf("charge %s to %s %s", formatMoney(amount, currency), customer, via),
+				checkCmd: oneShotCheckCmd(customer),
 				idemKey:  idemKey,
 			})
 			if err != nil {
@@ -120,9 +135,9 @@ func checkoutOneShotCmd(g *globals) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&customer, "customer", "", "customer id to charge (required)")
-	cmd.Flags().Int64Var(&amount, "amount", 0, "amount to charge in cents (required)")
+	cmd.Flags().Int64Var(&amount, "amount", 0, "amount to charge, in the currency's minor units (cents for EUR: 1999 is EUR 19.99) (required)")
 	cmd.Flags().StringVar(&currency, "currency", "EUR", "ISO-4217 currency code")
-	cmd.Flags().StringVar(&method, "method", "", "payment method: "+joinMethods()+" (required for --ui-mode hosted, refused for embedded)")
+	cmd.Flags().StringVar(&method, "payment-method", "", "payment method: "+joinMethods()+" (required for --ui-mode hosted, refused for embedded)")
 	cmd.Flags().StringVar(&uiMode, "ui-mode", "", "hosted (redirect to Mollie, the default) or embedded (returns a client_secret for the payment element)")
 	cmd.Flags().StringVar(&successURL, "success-url", "", "URL to redirect to after a successful payment (required)")
 	cmd.Flags().StringVar(&cancelURL, "cancel-url", "", "URL to redirect to if the customer cancels")
@@ -138,7 +153,7 @@ func checkoutOneShotCmd(g *globals) *cobra.Command {
 	_ = cmd.MarkFlagRequired("customer")
 	_ = cmd.MarkFlagRequired("amount")
 	_ = cmd.MarkFlagRequired("success-url")
-	_ = cmd.RegisterFlagCompletionFunc("method", func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
+	_ = cmd.RegisterFlagCompletionFunc("payment-method", func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
 		return oneShotMethods, cobra.ShellCompDirectiveNoFileComp
 	})
 	_ = cmd.RegisterFlagCompletionFunc("ui-mode", func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
@@ -178,23 +193,23 @@ var taxBehaviors = []string{"inclusive", "exclusive"}
 var uiModes = []string{"hosted", "embedded"}
 
 func buildOneShotBody(p oneShotParams) (map[string]any, error) {
-	if p.amount <= 0 {
-		return nil, fmt.Errorf("--amount must be a positive number of cents")
-	}
-	// Both refusals below are a bad invocation (exit 2), not a failed call:
-	// the server would answer 422 for either, and saying so here names the
+	// Every refusal here is a bad invocation (exit 2), not a failed call:
+	// the server would answer 400 for each, and saying so here names the
 	// flag to fix rather than an API field.
+	if p.amount <= 0 {
+		return nil, usageErrorf("--amount must be a positive whole number of minor units (cents for EUR), got %d", p.amount)
+	}
 	if p.uiMode != "" && !slices.Contains(uiModes, p.uiMode) {
 		return nil, &UsageError{fmt.Errorf("--ui-mode %q is not one of %s", p.uiMode, strings.Join(uiModes, ", "))}
 	}
 	embedded := p.uiMode == "embedded"
 	switch {
 	case embedded && p.method != "":
-		return nil, &UsageError{fmt.Errorf("--method cannot be used with --ui-mode embedded: the customer picks the method in the payment element")}
+		return nil, &UsageError{fmt.Errorf("--payment-method cannot be used with --ui-mode embedded: the customer picks the method in the payment element")}
 	case !embedded && p.method == "":
-		return nil, &UsageError{fmt.Errorf("--method is required unless --ui-mode is embedded (one of %s)", joinMethods())}
+		return nil, &UsageError{fmt.Errorf("--payment-method is required unless --ui-mode is embedded (one of %s)", joinMethods())}
 	case !embedded && !validMethod(p.method):
-		return nil, fmt.Errorf("--method %q is not one of %s", p.method, joinMethods())
+		return nil, usageErrorf("--payment-method %q is not one of %s", p.method, joinMethods())
 	}
 	body := map[string]any{
 		"customer_id":  p.customer,
@@ -205,7 +220,7 @@ func buildOneShotBody(p oneShotParams) (map[string]any, error) {
 	if embedded {
 		body["ui_mode"] = p.uiMode
 	} else {
-		body["method"] = p.method
+		body["payment_method"] = p.method
 		// An explicit --ui-mode hosted is sent, so what was typed is what the
 		// server sees; an omitted one is not, which keeps the body of every
 		// existing invocation byte-for-byte unchanged.
@@ -224,7 +239,7 @@ func buildOneShotBody(p oneShotParams) (map[string]any, error) {
 	}
 	if p.taxBehavior != "" {
 		if !slices.Contains(taxBehaviors, p.taxBehavior) {
-			return nil, fmt.Errorf("--tax-behavior %q is not one of %s", p.taxBehavior, strings.Join(taxBehaviors, ", "))
+			return nil, usageErrorf("--tax-behavior %q is not one of %s", p.taxBehavior, strings.Join(taxBehaviors, ", "))
 		}
 		body["tax_behavior"] = p.taxBehavior
 	}
@@ -234,26 +249,65 @@ func buildOneShotBody(p oneShotParams) (map[string]any, error) {
 	return body, nil
 }
 
-func checkoutRetrieveCmd(g *globals) *cobra.Command {
+func oneShotsListCmd(g *globals) *cobra.Command {
+	var (
+		customer      string
+		status        string
+		limit         int
+		startingAfter string
+	)
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List one-shot payments, newest first",
+		Long: "List one-shot payments, newest first.\n\n" +
+			"  billkit one-shots list --customer cus_123\n" +
+			"  billkit one-shots list --status paid --limit 50",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			q := url.Values{}
+			if err := setLimit(cmd, q, limit); err != nil {
+				return err
+			}
+			if customer != "" {
+				q.Set("customer_id", customer)
+			}
+			if status != "" {
+				q.Set("status", status)
+			}
+			if startingAfter != "" {
+				q.Set("starting_after", startingAfter)
+			}
+			return getAndPrint(cmd, g, withQuery("/v1/checkout/one_shot", q))
+		},
+	}
+	cmd.Flags().StringVar(&customer, "customer", "", "only this customer's one-shot payments")
+	cmd.Flags().StringVar(&status, "status", "", "only one-shot payments in this status")
+	cmd.Flags().IntVar(&limit, "limit", 0, limitUsage("one-shot payments"))
+	cmd.Flags().StringVar(&startingAfter, "starting-after", "", "cursor: return one-shot payments after this id")
+	return cmd
+}
+
+func oneShotsRetrieveCmd(g *globals) *cobra.Command {
 	return &cobra.Command{
 		Use:   "retrieve <one-shot-id>",
 		Short: "Fetch one one-shot payment by id",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, err := client(cmd, g)
-			if err != nil {
-				return err
-			}
-			ctx, cancel := context.WithTimeout(cmd.Context(), readTimeout)
-			defer cancel()
-			out, err := c.Do(ctx, "GET", "/v1/checkout/one_shot/"+url.PathEscape(args[0]), nil)
-			if err != nil {
-				return err
-			}
-			fprintJSON(cmd.OutOrStdout(), g.color, out)
-			return nil
+			return getAndPrint(cmd, g, "/v1/checkout/one_shot/"+url.PathEscape(args[0]))
 		},
 	}
+}
+
+// oneShotCheckCmd is the command that shows whether an ambiguous one-shot
+// create went through: the customer's one-shot payments, newest first.
+//
+// It used to name `billkit events list --type one_shot_payment.created`, an
+// event type the API has never emitted, so the one line printed at the moment
+// a user most needs to know whether they were charged sent them to a filter
+// the CLI itself rejects. It then named a raw `billkit api GET`, from before
+// one-shots had a list command of their own.
+func oneShotCheckCmd(customer string) string {
+	return "billkit one-shots list --customer " + shellQuote(customer)
 }
 
 func validMethod(method string) bool {

@@ -10,18 +10,16 @@
 package main
 
 import (
-	"fmt"
 	"os"
 
 	"github.com/billkit-eu/billkit-cli/internal/cli"
 )
 
 func main() {
-	if err := cli.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, "Error: "+err.Error())
-		// 2 for a bad invocation, 1 for a call that ran and failed. Every
-		// error used to exit 1, so a script could not tell a typo'd flag from
-		// a refused refund, and the one it should stop and fix is the typo.
-		os.Exit(cli.ExitCode(err))
-	}
+	// Main prints any error to stderr (as text, or as a JSON object under
+	// --json) and returns the exit status: 0 success, 1 a command that ran
+	// and failed, 2 a bad invocation, 4 no usable credential. Every error
+	// used to exit 1, so a script could not tell a typo'd flag from a refused
+	// refund, and the one it should stop and fix is the typo.
+	os.Exit(cli.Main())
 }

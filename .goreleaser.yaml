@@ -6,24 +6,26 @@
 # mirror's own `.github/workflows/publish.yml` (installed by the split, from
 # sdk/scripts/split-templates/cli/) is what invokes this file on a `v*` tag.
 #
-# Before a tag, validate with `goreleaser check` and a `goreleaser release
-# --snapshot --clean --skip=sign`. `--skip=sign` is needed because the `signs:`
-# block below is keyless and needs a GitHub OIDC token, which a laptop does not
-# have; everything else runs. Be aware that a snapshot does NOT exercise the
-# publish pipe, so it cannot catch a bad `homebrew_casks.repository.token`; see
-# the note on that field.
+# Before a tag, validate with `mise run //cli:release-check`, which is
+# `goreleaser check` plus `goreleaser release --snapshot --clean
+# --skip=sign,sbom,notarize`. `--skip=sign` is needed because the `signs:` block
+# below is keyless and needs a GitHub OIDC token, which a laptop does not have;
+# `sbom` needs syft; `notarize` needs the five Apple credentials. Be aware that a
+# snapshot does NOT exercise the publish pipe, so it cannot catch a bad
+# `homebrew_casks.repository.token`; see the note on that field.
 #
 # The macOS signing and notarization credentials are documented on the
 # `notarize:` block below, and mirrored in cli/README.md under "Signing and
 # notarization". Nothing secret lives in this file; it reads five environment
-# variables and skips itself when they are absent.
+# variables, and a real release fails without them (see `notarize:`).
 version: 2
 
 project_name: billkit
 
-before:
-  hooks:
-    - go mod tidy
+# There is deliberately no `before: hooks: [go mod tidy]` any more. A hook that
+# rewrites go.mod/go.sum on the release runner builds the binary from a module
+# graph no commit contains. Tidiness is checked instead, before a tag can
+# exist: `go mod tidy -diff` in the mirror's CI and in `mise run //cli:check`.
 
 builds:
   - id: billkit
@@ -34,8 +36,19 @@ builds:
     binary: billkit
     env:
       - CGO_ENABLED=0
+    # Reproducible: -trimpath drops the runner's filesystem paths from the
+    # binary, and every file's mtime is the commit's own timestamp, so the
+    # same tag builds the same bytes wherever it is built.
+    flags:
+      - -trimpath
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    # Commit and Date feed `billkit version`. CommitDate rather than Date, so
+    # the build time is the commit's and a rebuild does not change it.
     ldflags:
-      - -s -w -X github.com/billkit-eu/billkit-cli/internal/cli.Version={{ .Version }}
+      - -s -w
+      - -X github.com/billkit-eu/billkit-cli/internal/cli.Version={{ .Version }}
+      - -X github.com/billkit-eu/billkit-cli/internal/cli.Commit={{ .FullCommit }}
+      - -X github.com/billkit-eu/billkit-cli/internal/cli.Date={{ .CommitDate }}
     goos:
       - linux
       - darwin
@@ -74,23 +87,31 @@ builds:
 #   MACOS_NOTARY_KEY_ID      App Store Connect API key ID
 #   MACOS_NOTARY_KEY         base64 of the App Store Connect .p8 private key
 #
-# Degrading gracefully is deliberate, and it is the same bargain the Homebrew
-# cask makes below: a laptop snapshot, a fork, or a CI run without the secrets
-# still produces working archives instead of failing after the build. `index
-# .Env "..."` and not `.Env.MACOS_SIGN_P12`, because the dotted form is a hard
-# error when the name is absent from the environment entirely ("map has no entry
-# for key"), and absent is the normal state on a laptop.
+# Mandatory for a release. It used to skip itself when the credentials were
+# absent, the same bargain the Homebrew cask makes, and that bargain turned out
+# to be wrong here: a cask installed from an unsigned build is killed by
+# Gatekeeper at first launch on every user's Mac while the release job stays
+# green (HOMEBREW_CLI.md, "The one thing that will bite you"). So a real release
+# now always signs, and fails outright when any of the five is missing;
+# publish.yml checks for them first so the failure names what is missing before
+# anything is built. Only a snapshot (`--snapshot`, i.e. a laptop) still skips
+# unless all five are set, so `mise run //cli:release-check` keeps working
+# without Apple credentials.
 #
-# The gate requires all five rather than any one of them, on purpose. A partial
-# set would otherwise sign without notarizing, and a signed-but-unnotarized
-# binary still trips Gatekeeper, so it would look fixed and not be. All or
-# nothing keeps the two possible outcomes honest.
+# `index .Env "..."` and not `.Env.MACOS_SIGN_P12`, because the dotted form is a
+# hard error when the name is absent from the environment entirely ("map has no
+# entry for key"), and absent is the normal state on a laptop.
+#
+# For a snapshot the gate requires all five rather than any one of them, on
+# purpose. A partial set would otherwise sign without notarizing, and a
+# signed-but-unnotarized binary still trips Gatekeeper, so it would look fixed
+# and not be.
 notarize:
   macos:
     - ids:
         - billkit
       enabled: >-
-        {{ if and (index .Env "MACOS_SIGN_P12")
+        {{ if not .IsSnapshot }}true{{ else if and (index .Env "MACOS_SIGN_P12")
                   (index .Env "MACOS_SIGN_PASSWORD")
                   (index .Env "MACOS_NOTARY_ISSUER_ID")
                   (index .Env "MACOS_NOTARY_KEY_ID")
@@ -118,15 +139,52 @@ archives:
         formats:
           - zip
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    # The licence and the changelog travel with the binary, so an archive
+    # unpacked on its own still says what it is and what changed.
+    #
+    # Every entry carries the commit's timestamp and a fixed owner and mode,
+    # like the binary (builds_info). Without them a tar or zip records each
+    # file's checkout mtime and the runner's uid, so the archive, and with it
+    # checksums.txt, changed on every rebuild of the same tag even though the
+    # binary inside did not.
+    builds_info:
+      owner: root
+      group: root
+      mode: 0755
+      mtime: "{{ .CommitDate }}"
+    files:
+      - src: LICENSE
+        info: &fixed_file_info
+          owner: root
+          group: root
+          mode: 0644
+          mtime: "{{ .CommitDate }}"
+      - src: CHANGELOG.md
+        info: *fixed_file_info
+      - src: README.md
+        info: *fixed_file_info
 
 checksum:
   name_template: checksums.txt
+
+# A software bill of materials per archive, generated by syft (which
+# publish.yml installs) and published beside it as
+# `<archive>.sbom.json`. It lists the Go modules compiled into the binary, so
+# a customer's scanner can answer "does the CLI ship the vulnerable version of
+# X" without unpacking anything. The SBOM files are listed in checksums.txt
+# like every other asset, which puts them under the cosign signature below.
+#
+# A laptop snapshot needs syft on PATH, or `--skip=sbom` beside
+# `--skip=sign`.
+sboms:
+  - id: archives
+    artifacts: archive
 
 # Provenance for checksums.txt, and through it for every archive beside it.
 #
 # `install.sh` already verifies integrity: it reads checksums.txt and refuses an
 # archive that does not match. That catches a truncated download, a corrupted
-# mirror and a mangling proxy, and it catches nothing else — checksums.txt comes
+# mirror and a mangling proxy, and it catches nothing else: checksums.txt comes
 # down the same channel as the archive, so anyone able to rewrite one can
 # rewrite both. This block closes that gap: a signature over checksums.txt that
 # only this repository's release workflow could have produced, which is what
@@ -136,7 +194,7 @@ checksum:
 # job's GitHub OIDC token is exchanged for a certificate valid for minutes
 # (hence `id-token: write` in publish.yml), the signature is recorded in the
 # public Rekor transparency log, and a verifier checks the certificate's
-# *identity* — repo, workflow file and tag — rather than a public key we would
+# *identity* (repo, workflow file and tag) rather than a public key we would
 # otherwise have to publish and defend. Signing the checksum file rather than
 # each archive is deliberate and standard: the checksums already cover the
 # archives, so one signature covers the release.
@@ -146,7 +204,7 @@ checksum:
 # inconsistency. Those two depend on secrets a human has to set in repository
 # settings, where "forgotten" is a normal state and failing a release over it
 # helps nobody. This depends only on a permission declared in the workflow file
-# next to it, so "it did not run" can only mean that file is wrong — and the
+# next to it, so "it did not run" can only mean that file is wrong, and the
 # artifact of that mistake is a release whose provenance install.sh silently
 # cannot check. That one should fail loudly and be fixed.
 signs:
@@ -227,7 +285,7 @@ release:
   # Make a re-run idempotent. GoReleaser reuses an existing release for the tag
   # (createOrUpdateRelease), but by default a second upload of an asset that is
   # already there is a hard 422 `already_exists`, so re-running a job that failed
-  # *after* the upload step — which is exactly where the Homebrew cask push sits —
+  # *after* the upload step (which is exactly where the Homebrew cask push sits)
   # cannot get past the uploads to reach the step that failed. That happened on
   # v0.2.4 and had to be unpicked by deleting the seven assets by hand.
   replace_existing_artifacts: true

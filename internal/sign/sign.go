@@ -1,5 +1,5 @@
 // Package sign implements BillKit's webhook signature scheme
-// (BillKit-Signature: t=<unix>,v1=<hex>) — HMAC-SHA256 over "{t}.{body}" —
+// (BillKit-Signature: t=<unix>,v1=<hex>), an HMAC-SHA256 over "{t}.{body}"
 // matching the server's sign_outbound and every SDK's verifier. `billkit
 // listen` re-signs each forwarded event with a locally-generated secret so
 // the developer's app verifies it with any BillKit SDK.

@@ -48,7 +48,7 @@ func TestEventsListSendsItsCursor(t *testing.T) {
 
 // TestEventsListRejectsAnUnknownType. The API's `type` filter matches
 // exactly and never errors on a type that does not exist, so a typo returned
-// an empty page — which reads as "nothing happened" rather than "no such
+// an empty page, which reads as "nothing happened" rather than "no such
 // event type". `listen --events` has refused this locally for a while; this
 // is the same validator, with the same wording, on the other command that
 // takes an event type.

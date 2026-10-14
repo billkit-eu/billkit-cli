@@ -1,6 +1,16 @@
 package cli
 
-import "testing"
+import (
+	"bytes"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+)
 
 func TestBuildOneShotBody(t *testing.T) {
 	t.Run("embedded sends ui_mode and no method", func(t *testing.T) {
@@ -14,7 +24,7 @@ func TestBuildOneShotBody(t *testing.T) {
 		if body["ui_mode"] != "embedded" {
 			t.Fatalf("ui_mode = %v, body = %v", body["ui_mode"], body)
 		}
-		if _, ok := body["method"]; ok {
+		if _, ok := body["payment_method"]; ok {
 			t.Fatalf("method must be omitted for embedded, body = %v", body)
 		}
 	})
@@ -25,7 +35,7 @@ func TestBuildOneShotBody(t *testing.T) {
 			successURL: "https://x.test/ok",
 		})
 		if err == nil {
-			t.Fatal("expected an error for --method with --ui-mode embedded")
+			t.Fatal("expected an error for --payment-method with --ui-mode embedded")
 		}
 		if ExitCode(err) != ExitUsage {
 			t.Fatalf("ExitCode = %d, want %d (err: %v)", ExitCode(err), ExitUsage, err)
@@ -60,7 +70,7 @@ func TestBuildOneShotBody(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if explicit["ui_mode"] != "hosted" || explicit["method"] != "ideal" {
+		if explicit["ui_mode"] != "hosted" || explicit["payment_method"] != "ideal" {
 			t.Fatalf("body = %v", explicit)
 		}
 		omitted, err := buildOneShotBody(oneShotParams{
@@ -86,7 +96,7 @@ func TestBuildOneShotBody(t *testing.T) {
 			t.Fatal(err)
 		}
 		if body["customer_id"] != "cus_1" || body["amount_cents"] != int64(1999) ||
-			body["currency"] != "EUR" || body["method"] != "ideal" || body["success_url"] != "https://x.test/ok" {
+			body["currency"] != "EUR" || body["payment_method"] != "ideal" || body["success_url"] != "https://x.test/ok" {
 			t.Fatalf("body = %v", body)
 		}
 		// Optional fields are omitted when unset.
@@ -133,8 +143,8 @@ func TestBuildOneShotBody(t *testing.T) {
 		if err != nil {
 			t.Fatalf("paypal should be accepted: %v", err)
 		}
-		if body["method"] != "paypal" {
-			t.Fatalf("method = %v", body["method"])
+		if body["payment_method"] != "paypal" {
+			t.Fatalf("method = %v", body["payment_method"])
 		}
 	})
 
@@ -148,6 +158,28 @@ func TestBuildOneShotBody(t *testing.T) {
 			}); err != nil {
 				t.Errorf("method %q is offered but refused: %v", m, err)
 			}
+		}
+	})
+
+	// directdebit is not in the API's one-shot enum (SEPA needs a mandate),
+	// so it is refused locally as an unknown method and never offered.
+	t.Run("directdebit is refused locally and never offered", func(t *testing.T) {
+		if slices.Contains(oneShotMethods, "directdebit") {
+			t.Fatal("directdebit is offered, but a one-off charge cannot use it")
+		}
+		_, err := buildOneShotBody(oneShotParams{
+			customer: "cus_1", amount: 1, currency: "EUR", method: "directdebit", successURL: "https://x.test/ok",
+		})
+		var usage *UsageError
+		if !errors.As(err, &usage) || !strings.Contains(err.Error(), `--payment-method "directdebit" is not one of`) {
+			t.Fatalf("want a usage error refusing directdebit, got %v", err)
+		}
+		help := oneShotsCreateCmd(&globals{}).Flags().Lookup("payment-method").Usage
+		if strings.Contains(help, "directdebit") {
+			t.Fatalf("--payment-method help still lists directdebit: %q", help)
+		}
+		if strings.Contains(oneShotsCreateCmd(&globals{}).Short, "off-session") {
+			t.Fatal("a one-shot is paid by the customer on a hosted page or in the element, not off-session")
 		}
 	})
 
@@ -190,4 +222,108 @@ func TestBuildOneShotBody(t *testing.T) {
 			t.Fatal("expected error for zero amount")
 		}
 	})
+}
+
+// TestOneShotCheckHintIsARunnableCommand. After an ambiguous one-shot create,
+// the CLI prints a command to check whether the charge went through. It used
+// to print `billkit events list --type one_shot_payment.created`, an event
+// type the API does not have. This takes the printed line, parses it the way
+// a shell would, runs it through the real command tree, and checks it lists
+// that customer's one-shot payments.
+func TestOneShotCheckHintIsARunnableCommand(t *testing.T) {
+	t.Setenv("BILLKIT_CONFIG_HOME", t.TempDir())
+	const customer = "cus_1 &x=y"
+	var mu sync.Mutex
+	var gets []*http.Request
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		mu.Lock()
+		gets = append(gets, r)
+		mu.Unlock()
+		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+	}))
+	defer srv.Close()
+	t.Setenv("BILLKIT_API_KEY", "bk_test_x")
+	t.Setenv("BILLKIT_BASE_URL", srv.URL)
+
+	stderr, err := runCLI(t, "one-shots", "create", "--customer", customer, "--amount", "100",
+		"--payment-method", "ideal", "--success-url", "https://x.test/ok")
+	if err == nil {
+		t.Fatal("a 503 must fail the create")
+	}
+	_, hint, ok := strings.Cut(stderr, "Check first:")
+	if !ok {
+		t.Fatalf("no check hint printed; stderr = %q", stderr)
+	}
+	hint, _, _ = strings.Cut(strings.TrimSpace(hint), "\n")
+	words := shellWords(t, hint)
+	if len(words) < 2 || words[0] != "billkit" {
+		t.Fatalf("the hint is not a billkit command: %q", hint)
+	}
+	// The first-class list command, now that one-shots have one, rather
+	// than a raw `billkit api GET` a user has to read a query string in.
+	if words[1] != "one-shots" || words[2] != "list" {
+		t.Errorf("the hint should be `billkit one-shots list`, got %q", hint)
+	}
+
+	root := rootCmd()
+	root.SetOut(io.Discard)
+	root.SetErr(&bytes.Buffer{})
+	root.SetIn(strings.NewReader(""))
+	root.SetArgs(words[1:])
+	if err := root.Execute(); err != nil {
+		t.Fatalf("the printed hint %q does not run: %v", hint, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(gets) != 1 {
+		t.Fatalf("the hint made %d GET requests, want 1", len(gets))
+	}
+	if got := gets[0].URL.Path; got != "/v1/checkout/one_shot" {
+		t.Errorf("the hint reads %s, want /v1/checkout/one_shot", got)
+	}
+	if got := gets[0].URL.Query().Get("customer_id"); got != customer {
+		t.Errorf("customer_id = %q, want %q", got, customer)
+	}
+}
+
+// shellWords splits a command line the way a POSIX shell does for the only
+// quoting shellQuote produces: bare words and single-quoted runs.
+func shellWords(t *testing.T, line string) []string {
+	t.Helper()
+	var words []string
+	var cur strings.Builder
+	inWord, quoted := false, false
+	for _, r := range line {
+		switch {
+		case quoted && r == '\'':
+			quoted = false
+		case quoted:
+			cur.WriteRune(r)
+		case r == '\'':
+			quoted, inWord = true, true
+		case r == ' ' || r == '\t':
+			if inWord {
+				words = append(words, cur.String())
+				cur.Reset()
+				inWord = false
+			}
+		default:
+			if strings.ContainsRune("\"\\$`|&;<>()*?[]{}#~!", r) {
+				t.Fatalf("unquoted shell metacharacter %q in %q", r, line)
+			}
+			cur.WriteRune(r)
+			inWord = true
+		}
+	}
+	if quoted {
+		t.Fatalf("unterminated quote in %q", line)
+	}
+	if inWord {
+		words = append(words, cur.String())
+	}
+	return words
 }
