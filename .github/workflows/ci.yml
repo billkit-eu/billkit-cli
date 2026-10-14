@@ -14,7 +14,7 @@ on:
 
 jobs:
   test:
-    name: Go ${{ matrix.go }} on ${{ matrix.os }}
+    name: Go on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -22,13 +22,16 @@ jobs:
         # The CLI ships for all three, writes files with an eye on their
         # permission models, and reads terminals, so all three get tested.
         os: [ubuntu-latest, macos-latest, windows-latest]
-        go: ['1.26']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The exact patch release go.mod's `toolchain` line names, as publish.yml
+      # does. `go-version: '1.26'` took whatever 1.26.x the runner had cached,
+      # and setup-go sets GOTOOLCHAIN=local, so the toolchain line was ignored
+      # and govulncheck went red on stdlib fixes go.mod had already picked up.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: ${{ matrix.go }}
+          go-version-file: go.mod
 
       - name: Format check
         if: runner.os == 'Linux'

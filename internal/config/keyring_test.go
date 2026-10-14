@@ -355,6 +355,9 @@ func TestANewerSchemaIsReadButNeverRewritten(t *testing.T) {
 func TestDefaultDirFollowsThePlatformConvention(t *testing.T) {
 	home := func() (string, error) { return "/home/ada", nil }
 	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
+	// Absolute on the host running the test: "/xdg" has no volume name, so on
+	// Windows filepath.IsAbs rejects it and the relative-value rule kicks in.
+	xdg := filepath.Join(t.TempDir(), "xdg")
 	cases := []struct {
 		name string
 		goos string
@@ -363,8 +366,8 @@ func TestDefaultDirFollowsThePlatformConvention(t *testing.T) {
 	}{
 		{"linux default", "linux", nil, filepath.Join("/home/ada", ".config", "billkit")},
 		{"macOS default, like the Stripe CLI", "darwin", nil, filepath.Join("/home/ada", ".config", "billkit")},
-		{"XDG_CONFIG_HOME", "linux", map[string]string{"XDG_CONFIG_HOME": "/xdg"}, filepath.Join("/xdg", "billkit")},
-		{"XDG_CONFIG_HOME on macOS", "darwin", map[string]string{"XDG_CONFIG_HOME": "/xdg"}, filepath.Join("/xdg", "billkit")},
+		{"XDG_CONFIG_HOME", "linux", map[string]string{"XDG_CONFIG_HOME": xdg}, filepath.Join(xdg, "billkit")},
+		{"XDG_CONFIG_HOME on macOS", "darwin", map[string]string{"XDG_CONFIG_HOME": xdg}, filepath.Join(xdg, "billkit")},
 		{"a relative XDG_CONFIG_HOME is ignored", "linux", map[string]string{"XDG_CONFIG_HOME": "rel"}, filepath.Join("/home/ada", ".config", "billkit")},
 		{"windows APPDATA", "windows", map[string]string{"APPDATA": `C:\Users\ada\AppData\Roaming`}, filepath.Join(`C:\Users\ada\AppData\Roaming`, "billkit")},
 		{"windows without APPDATA", "windows", nil, filepath.Join("/home/ada", "AppData", "Roaming", "billkit")},
@@ -391,7 +394,9 @@ func TestBillkitConfigHomeStillWins(t *testing.T) {
 }
 
 // legacyHome sets up a $HOME holding a 0.x ~/.billkit/config.json and an
-// XDG_CONFIG_HOME for the new location, and returns both directories.
+// XDG_CONFIG_HOME for the new location, and returns both directories. APPDATA
+// points at the same place, so on Windows the new location is the same and a
+// test never writes into the real %APPDATA%\billkit.
 func legacyHome(t *testing.T, body string) (home, xdg string) {
 	t.Helper()
 	home = t.TempDir()
@@ -400,6 +405,7 @@ func legacyHome(t *testing.T, body string) (home, xdg string) {
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("BILLKIT_CONFIG_HOME", "")
 	t.Setenv("XDG_CONFIG_HOME", xdg)
+	t.Setenv("APPDATA", xdg)
 	if err := os.MkdirAll(filepath.Join(home, ".billkit"), 0o700); err != nil {
 		t.Fatal(err)
 	}

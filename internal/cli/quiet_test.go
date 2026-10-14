@@ -91,6 +91,7 @@ func TestCompletionNeverMovesTheConfig(t *testing.T) {
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("BILLKIT_CONFIG_HOME", "")
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+	t.Setenv("APPDATA", filepath.Join(home, "xdg"))
 	legacy := filepath.Join(home, ".billkit", "config.json")
 	if err := os.MkdirAll(filepath.Dir(legacy), 0o700); err != nil {
 		t.Fatal(err)
